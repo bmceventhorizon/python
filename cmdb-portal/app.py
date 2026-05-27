@@ -2,6 +2,7 @@ import html
 import json
 import mimetypes
 import os
+import re
 import shlex
 import sys
 import time
@@ -318,6 +319,13 @@ def checked_db_config():
     return config
 
 
+PLACEHOLDER_RE = re.compile(r"(?<!%)%(?:\([A-Za-z_][A-Za-z0-9_]*\))?[sbt]")
+
+
+def sql_uses_placeholders(sql):
+    return bool(PLACEHOLDER_RE.search(sql))
+
+
 def execute_sql(sql, params=None):
     driver_name, driver = import_postgres_driver()
     if driver is None:
@@ -326,16 +334,23 @@ def execute_sql(sql, params=None):
         )
 
     config = checked_db_config()
+    execute_params = params if params and sql_uses_placeholders(sql) else None
     if driver_name == "psycopg":
         with driver.connect(**config) as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, params or {})
+                if execute_params:
+                    cur.execute(sql, execute_params)
+                else:
+                    cur.execute(sql)
                 columns = [desc[0] for desc in cur.description]
                 rows = cur.fetchall()
     else:
         with driver.connect(**config) as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, params or {})
+                if execute_params:
+                    cur.execute(sql, execute_params)
+                else:
+                    cur.execute(sql)
                 columns = [desc[0] for desc in cur.description]
                 rows = cur.fetchall()
     return columns, rows
