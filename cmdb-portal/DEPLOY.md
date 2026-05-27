@@ -28,7 +28,7 @@ chmod +x install.sh start.sh
 ./install.sh
 ./start.sh
 
-Open http://127.0.0.1:8000 and enter your read-only PostgreSQL connection details.
+Open http://127.0.0.1:8000 and enter your read-only PostgreSQL connection details. Enter CMDB REST credentials only if you plan to apply duplicate-resolution changes.
 ```
 
 ## What To Share
@@ -89,10 +89,18 @@ PGUSER=your_read_only_user
 PGPASSWORD=your_password
 PGSSLMODE=prefer
 PGCONNECT_TIMEOUT=5
+CMDB_REST_BASE_URL=http://your_cmdb_host:8008
+CMDB_REST_USERNAME=your_ar_user
+CMDB_REST_PASSWORD=your_ar_password
+CMDB_REST_NAMESPACE=BMC.CORE
+CMDB_REST_CLASS=BMC_BaseElement
+CMDB_REST_DELETE_OPTION=PURGE
 PORT=8000
 ```
 
 Use a read-only PostgreSQL user.
+
+Use an AR user for CMDB REST operations. Do not use the PostgreSQL reporting user for REST login unless that is also a valid AR account.
 
 ## PostgreSQL Permissions
 
@@ -156,16 +164,35 @@ To import a package:
 
 Review SQL before importing packages from other people.
 
-## Duplicate Cleanup SQL
+## ADDM Duplicate Resolution
 
-The **Duplicate Cleanup SQL** panel generates two statements:
+The **ADDM Duplicate Resolution Preview** panel runs read-only SQL to find candidate duplicate CIs and show the evidence used for bulk selection:
 
 ```text
-Preview Duplicates SQL
-Mark Duplicates SQL
+DatasetId
+InstanceId
+SerialNumber
+ADDMIntegrationId
+LastScanDate
+MarkAsDeleted
+relationship_count
+resolution_status
 ```
 
-It uses `row_number()` over the duplicate-match columns to keep the first row by date and mark later duplicate rows. The portal does not execute this update automatically. Review the preview, confirm the duplicate rules, and take a backup before running the update SQL manually.
+Saved reports and duplicate previews remain read-only SQL. The portal does not run SQL update statements for cleanup.
+
+When the admin confirms an apply action, selected duplicate CIs are updated through BMC CMDB REST API:
+
+```text
+Soft mark only
+PATCH /api/cmdb/v1.0/instances/{datasetId}/{namespace}/{className}/{instanceId}
+sets MarkAsDeleted = 1
+
+Delete CMDB instance through REST
+DELETE /api/cmdb/v1.0/instances/{datasetId}/{namespace}/{className}/{instanceId}?delete_option=PURGE
+```
+
+Use soft mark when you want the CI marked to be deleted later. Use hard delete only when you really want CMDB REST to purge the selected instance and your dataset allows it.
 
 ## AI Query Generator
 
