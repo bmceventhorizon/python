@@ -49,6 +49,10 @@ Use the Report Editor in the browser to save custom read-only SQL reports.
 Reports are stored locally in `reports.json`.
 Saved reports must remain read-only SQL. Duplicate updates are applied through CMDB REST, not SQL updates.
 
+## Query Results Export
+
+After running a query, use **Export Spreadsheet** above the results table to download the current result set as an `.xlsx` file.
+
 ## Report Packages
 
 Use **Report Packages** in the browser to export saved reports as a JSON package or import reports from a package.

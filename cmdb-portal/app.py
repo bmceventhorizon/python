@@ -1,4 +1,5 @@
 import html
+import io
 import json
 import mimetypes
 import os
@@ -9,8 +10,10 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlparse
+from xml.sax.saxutils import escape as xml_escape
 
 from queries import DEFAULT_CLASSES, QUERIES
 
@@ -354,6 +357,84 @@ def execute_sql(sql, params=None):
                 columns = [desc[0] for desc in cur.description]
                 rows = cur.fetchall()
     return columns, rows
+
+
+def column_letter(index):
+    index += 1
+    letters = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def xlsx_cell(row_number, column_index, value):
+    reference = f"{column_letter(column_index)}{row_number}"
+    if value is None:
+        return f'<c r="{reference}"/>'
+    if isinstance(value, bool):
+        return f'<c r="{reference}" t="b"><v>{1 if value else 0}</v></c>'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c r="{reference}"><v>{value}</v></c>'
+    text = xml_escape(str(value), {'"': "&quot;"})
+    preserve = ' xml:space="preserve"' if text.strip() != text else ""
+    return f'<c r="{reference}" t="inlineStr"><is><t{preserve}>{text}</t></is></c>'
+
+
+def build_xlsx(columns, rows):
+    sheet_rows = []
+    header_cells = [xlsx_cell(1, index, column) for index, column in enumerate(columns)]
+    sheet_rows.append(f'<row r="1">{"".join(header_cells)}</row>')
+    for row_index, row in enumerate(rows, start=2):
+        cells = [xlsx_cell(row_index, col_index, value) for col_index, value in enumerate(row)]
+        sheet_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+
+    sheet_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    {''.join(sheet_rows)}
+  </sheetData>
+</worksheet>
+"""
+    workbook_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Results" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>
+"""
+    workbook_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>
+"""
+    root_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>
+"""
+    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>
+"""
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as workbook:
+        workbook.writestr("[Content_Types].xml", content_types)
+        workbook.writestr("_rels/.rels", root_rels)
+        workbook.writestr("xl/workbook.xml", workbook_xml)
+        workbook.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        workbook.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return output.getvalue()
+
+
+def safe_filename(value, fallback="cmdb-query-results"):
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value).strip()).strip("-._")
+    return cleaned[:80] or fallback
 
 
 def cmdb_rest_config():
@@ -1427,6 +1508,15 @@ def render_layout(body):
       padding: 4px 9px;
       background: #fbfcfd;
     }}
+    .export-pill {{
+      color: var(--accent);
+      font-weight: 700;
+      text-decoration: none;
+    }}
+    .export-pill:hover {{
+      border-color: var(--accent);
+      background: #eef8fb;
+    }}
     .error {{
       border: 1px solid #e5b4b4;
       background: #fff7f7;
@@ -2119,6 +2209,17 @@ def render_table(columns, rows):
 """
 
 
+def result_export_query(query_key, params):
+    query = {
+        "query": query_key,
+        "datasetids": params["datasetids"],
+        "hours": params["hours"],
+        "limit": params["limit"],
+        "classids": "\n".join(params["classids"]),
+    }
+    return urlencode(query, doseq=True)
+
+
 def render_page(
     query_key,
     params,
@@ -2141,10 +2242,12 @@ def render_page(
         result_html = f'<div class="panel-body"><div class="error">{esc(error)}</div></div>'
     elif result:
         columns, rows = result
+        export_href = f"/results/export?{result_export_query(query_key, params)}"
         result_html = (
             f'<div class="panel-body"><div class="status">'
             f'<span class="pill">{esc(len(rows))} rows</span>'
             f'<span class="pill">{esc(db_label)}</span>'
+            f'<a class="pill export-pill" href="{esc(export_href)}">Export Spreadsheet</a>'
             f"</div></div>"
             + render_table(columns, rows)
         )
@@ -2302,6 +2405,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path.startswith("/assets/"):
             self.serve_asset(parsed.path)
+            return
+
+        if parsed.path == "/results/export":
+            form = parse_qs(parsed.query)
+            query_key = selected_query_key(form.get("query", [f"{BUILTIN_PREFIX}ci_by_class"])[0])
+            params = query_params(form)
+            try:
+                columns, rows = run_query(query_key, params)
+                report_name = query_catalog()[query_key]["name"]
+                payload = build_xlsx(columns, rows)
+                filename = f"{safe_filename(report_name)}-results.xlsx"
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as exc:
+                payload = str(exc).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
             return
 
         if parsed.path == "/reports/export":

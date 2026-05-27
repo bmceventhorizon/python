@@ -126,6 +126,10 @@ reports.json
 
 That file is intentionally excluded from the install package by default. If you want to distribute starter reports, create a sanitized `reports.json` and include it intentionally.
 
+## Query Results Export
+
+After running a query, users can click **Export Spreadsheet** above the results table to download the current result set as an `.xlsx` file. The export reruns the selected query with the same filters before streaming the workbook to the browser.
+
 ## Report Packages
 
 Use **Report Packages** in the browser to distribute SQL reports separately from the app.
