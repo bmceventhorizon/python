@@ -9,12 +9,12 @@ import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from queries import DEFAULT_CLASSES, QUERIES
 
 
-APP_TITLE = "CMDB Data Management Dashboard"
+APP_TITLE = "CMDB Data Management Dashboard by BMC Helix Seal Team"
 ENV_PATH = ".env"
 REPORTS_PATH = "reports.json"
 BUILTIN_PREFIX = "builtin:"
@@ -23,6 +23,10 @@ ASSETS_DIR = "assets"
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
 DEFAULT_CURSOR_MODEL = "auto"
+DEFAULT_CMDB_REST_PORT = "8008"
+DEFAULT_CMDB_NAMESPACE = "BMC.CORE"
+DEFAULT_CMDB_CLASS = "BMC_BaseElement"
+DEFAULT_CMDB_DELETE_OPTION = "PURGE"
 AI_PROVIDERS = {
     "openai": "ChatGPT / OpenAI",
     "anthropic": "Claude / Anthropic",
@@ -113,6 +117,15 @@ def save_db_settings(form, path=ENV_PATH):
         "ANTHROPIC_MODEL": os.getenv("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
         "CURSOR_MODEL": os.getenv("CURSOR_MODEL", DEFAULT_CURSOR_MODEL),
         "AI_PROVIDER": os.getenv("AI_PROVIDER", "openai"),
+        "CMDB_REST_BASE_URL": os.getenv(
+            "CMDB_REST_BASE_URL",
+            f"http://{form.get('pghost', ['localhost'])[0].strip()}:{DEFAULT_CMDB_REST_PORT}",
+        ),
+        "CMDB_REST_USERNAME": os.getenv("CMDB_REST_USERNAME", ""),
+        "CMDB_REST_PASSWORD": os.getenv("CMDB_REST_PASSWORD", ""),
+        "CMDB_REST_NAMESPACE": os.getenv("CMDB_REST_NAMESPACE", DEFAULT_CMDB_NAMESPACE),
+        "CMDB_REST_CLASS": os.getenv("CMDB_REST_CLASS", DEFAULT_CMDB_CLASS),
+        "CMDB_REST_DELETE_OPTION": os.getenv("CMDB_REST_DELETE_OPTION", DEFAULT_CMDB_DELETE_OPTION),
         "PORT": os.getenv("PORT", "8000"),
     }
     write_env_settings(settings, path)
@@ -147,9 +160,90 @@ def save_ai_settings(form, path=ENV_PATH):
         "CURSOR_MODEL": form.get("cursor_model", [os.getenv("CURSOR_MODEL", DEFAULT_CURSOR_MODEL)])[0].strip()
         or DEFAULT_CURSOR_MODEL,
         "AI_PROVIDER": provider,
+        "CMDB_REST_BASE_URL": os.getenv("CMDB_REST_BASE_URL", default_cmdb_rest_base_url()),
+        "CMDB_REST_USERNAME": os.getenv("CMDB_REST_USERNAME", os.getenv("PGUSER", "")),
+        "CMDB_REST_PASSWORD": os.getenv("CMDB_REST_PASSWORD", os.getenv("PGPASSWORD", "")),
+        "CMDB_REST_NAMESPACE": os.getenv("CMDB_REST_NAMESPACE", DEFAULT_CMDB_NAMESPACE),
+        "CMDB_REST_CLASS": os.getenv("CMDB_REST_CLASS", DEFAULT_CMDB_CLASS),
+        "CMDB_REST_DELETE_OPTION": os.getenv("CMDB_REST_DELETE_OPTION", DEFAULT_CMDB_DELETE_OPTION),
         "PORT": os.getenv("PORT", "8000"),
     }
     write_env_settings(settings, path)
+
+
+def default_cmdb_rest_base_url():
+    host = os.getenv("PGHOST", "localhost")
+    return f"http://{host}:{DEFAULT_CMDB_REST_PORT}"
+
+
+def normalize_cmdb_delete_option(value):
+    option = str(value or "").strip()
+    if option in {"", "0", "1"}:
+        return DEFAULT_CMDB_DELETE_OPTION
+    if option.lower() in {"purge", "delete"}:
+        return "PURGE"
+    if option.lower() in {"mark_as_deleted", "mark-as-deleted", "markasdeleted"}:
+        return "MARK_AS_DELETED"
+    return option
+
+
+def save_rest_settings(form, path=ENV_PATH):
+    new_password = form.get("cmdb_rest_password", [""])[0]
+    if not new_password:
+        new_password = os.getenv("CMDB_REST_PASSWORD", os.getenv("PGPASSWORD", ""))
+    settings = current_env_settings()
+    settings.update(
+        {
+            "CMDB_REST_BASE_URL": form.get(
+                "cmdb_rest_base_url", [os.getenv("CMDB_REST_BASE_URL", default_cmdb_rest_base_url())]
+            )[0].strip().rstrip("/"),
+            "CMDB_REST_USERNAME": form.get(
+                "cmdb_rest_username", [os.getenv("CMDB_REST_USERNAME", os.getenv("PGUSER", ""))]
+            )[0].strip(),
+            "CMDB_REST_PASSWORD": new_password,
+            "CMDB_REST_NAMESPACE": form.get(
+                "cmdb_rest_namespace", [os.getenv("CMDB_REST_NAMESPACE", DEFAULT_CMDB_NAMESPACE)]
+            )[0].strip()
+            or DEFAULT_CMDB_NAMESPACE,
+            "CMDB_REST_CLASS": form.get("cmdb_rest_class", [os.getenv("CMDB_REST_CLASS", DEFAULT_CMDB_CLASS)])[
+                0
+            ].strip()
+            or DEFAULT_CMDB_CLASS,
+            "CMDB_REST_DELETE_OPTION": normalize_cmdb_delete_option(
+                form.get(
+                    "cmdb_rest_delete_option", [os.getenv("CMDB_REST_DELETE_OPTION", DEFAULT_CMDB_DELETE_OPTION)]
+                )[0]
+            ),
+        }
+    )
+    write_env_settings(settings, path)
+
+
+def current_env_settings():
+    return {
+        "PGHOST": os.getenv("PGHOST", "localhost"),
+        "PGPORT": os.getenv("PGPORT", "5432"),
+        "PGDATABASE": os.getenv("PGDATABASE", ""),
+        "PGUSER": os.getenv("PGUSER", ""),
+        "PGPASSWORD": os.getenv("PGPASSWORD", ""),
+        "PGSSLMODE": os.getenv("PGSSLMODE", "prefer"),
+        "PGCONNECT_TIMEOUT": os.getenv("PGCONNECT_TIMEOUT", "5"),
+        "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
+        "OPENAI_MODEL": os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+        "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", os.getenv("CLAUDE_API_KEY", "")),
+        "ANTHROPIC_MODEL": os.getenv("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
+        "CURSOR_MODEL": os.getenv("CURSOR_MODEL", DEFAULT_CURSOR_MODEL),
+        "AI_PROVIDER": os.getenv("AI_PROVIDER", "openai"),
+        "CMDB_REST_BASE_URL": os.getenv("CMDB_REST_BASE_URL", default_cmdb_rest_base_url()),
+        "CMDB_REST_USERNAME": os.getenv("CMDB_REST_USERNAME", os.getenv("PGUSER", "")),
+        "CMDB_REST_PASSWORD": os.getenv("CMDB_REST_PASSWORD", os.getenv("PGPASSWORD", "")),
+        "CMDB_REST_NAMESPACE": os.getenv("CMDB_REST_NAMESPACE", DEFAULT_CMDB_NAMESPACE),
+        "CMDB_REST_CLASS": os.getenv("CMDB_REST_CLASS", DEFAULT_CMDB_CLASS),
+        "CMDB_REST_DELETE_OPTION": normalize_cmdb_delete_option(
+            os.getenv("CMDB_REST_DELETE_OPTION", DEFAULT_CMDB_DELETE_OPTION)
+        ),
+        "PORT": os.getenv("PORT", "8000"),
+    }
 
 
 def write_env_settings(settings, path=ENV_PATH):
@@ -168,6 +262,12 @@ def write_env_settings(settings, path=ENV_PATH):
         f"ANTHROPIC_MODEL={settings.get('ANTHROPIC_MODEL', DEFAULT_ANTHROPIC_MODEL)}",
         f"CURSOR_MODEL={settings.get('CURSOR_MODEL', DEFAULT_CURSOR_MODEL)}",
         f"AI_PROVIDER={settings.get('AI_PROVIDER', 'openai')}",
+        f"CMDB_REST_BASE_URL={settings.get('CMDB_REST_BASE_URL', default_cmdb_rest_base_url())}",
+        f"CMDB_REST_USERNAME={settings.get('CMDB_REST_USERNAME', os.getenv('PGUSER', ''))}",
+        f"CMDB_REST_PASSWORD={settings.get('CMDB_REST_PASSWORD', os.getenv('PGPASSWORD', ''))}",
+        f"CMDB_REST_NAMESPACE={settings.get('CMDB_REST_NAMESPACE', DEFAULT_CMDB_NAMESPACE)}",
+        f"CMDB_REST_CLASS={settings.get('CMDB_REST_CLASS', DEFAULT_CMDB_CLASS)}",
+        f"CMDB_REST_DELETE_OPTION={normalize_cmdb_delete_option(settings.get('CMDB_REST_DELETE_OPTION', DEFAULT_CMDB_DELETE_OPTION))}",
         f"PORT={settings['PORT']}",
         "",
     ]
@@ -241,6 +341,250 @@ def execute_sql(sql, params=None):
     return columns, rows
 
 
+def cmdb_rest_config():
+    return {
+        "base_url": os.getenv("CMDB_REST_BASE_URL", default_cmdb_rest_base_url()).rstrip("/"),
+        "username": os.getenv("CMDB_REST_USERNAME", os.getenv("PGUSER", "")),
+        "password": os.getenv("CMDB_REST_PASSWORD", os.getenv("PGPASSWORD", "")),
+        "namespace": os.getenv("CMDB_REST_NAMESPACE", DEFAULT_CMDB_NAMESPACE),
+        "class_name": os.getenv("CMDB_REST_CLASS", DEFAULT_CMDB_CLASS),
+        "delete_option": normalize_cmdb_delete_option(os.getenv("CMDB_REST_DELETE_OPTION", DEFAULT_CMDB_DELETE_OPTION)),
+    }
+
+
+def checked_cmdb_rest_config():
+    config = cmdb_rest_config()
+    missing = [key for key in ("base_url", "username", "password", "namespace", "class_name") if not config[key]]
+    if missing:
+        raise RuntimeError("Missing CMDB REST settings: " + ", ".join(missing))
+    return config
+
+
+def cmdb_rest_login(config):
+    data = urlencode({"username": config["username"], "password": config["password"]}).encode("utf-8")
+    req = urllib.request.Request(
+        f'{config["base_url"]}/api/jwt/login',
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return response.read().decode("utf-8").strip().strip('"')
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"CMDB REST login failed: {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"CMDB REST login failed: {exc.reason}") from exc
+
+
+def cmdb_auth_headers(token):
+    return {
+        "Authorization": f"AR-JWT {token}",
+        "Accept": "application/json",
+    }
+
+
+def cmdb_json_headers(token):
+    headers = cmdb_auth_headers(token)
+    headers["Content-Type"] = "application/json"
+    return headers
+
+
+def cmdb_instance_path(config, datasetid, instanceid=None):
+    parts = [
+        config["base_url"],
+        "api",
+        "cmdb",
+        "v1.0",
+        "instances",
+        quote(str(datasetid), safe=""),
+        quote(config["namespace"], safe=""),
+        quote(config["class_name"], safe=""),
+    ]
+    if instanceid:
+        parts.append(quote(str(instanceid), safe=""))
+    return "/".join(part.strip("/") for part in parts)
+
+
+def cmdb_lookup_url(config, datasetid, instanceid):
+    qualification = f"'InstanceId'=\"{str(instanceid).replace(chr(34), chr(92) + chr(34))}\""
+    query = urlencode(
+        {
+            "qualification": qualification,
+            "limit": "2",
+            "offset": "0",
+            "attributes": "InstanceId,DatasetId,ClassId,Name,MarkAsDeleted",
+        }
+    )
+    return f"{cmdb_instance_path(config, datasetid)}?{query}"
+
+
+def cmdb_parse_instances(payload):
+    if isinstance(payload, dict):
+        instances = payload.get("instances")
+        if isinstance(instances, list):
+            return instances
+        if "instance_id" in payload or "attributes" in payload:
+            return [payload]
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def cmdb_lookup_instance(config, token, datasetid, instanceid):
+    url = cmdb_lookup_url(config, datasetid, instanceid)
+    req = urllib.request.Request(url, headers=cmdb_auth_headers(token), method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Lookup failed: {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Lookup failed: {exc.reason}") from exc
+    return url, cmdb_parse_instances(payload)
+
+
+def cmdb_soft_mark_instance_deleted(config, token, datasetid, instanceid):
+    url = cmdb_instance_path(config, datasetid, instanceid)
+    body = {
+        "instance_id": str(instanceid),
+        "dataset_id": str(datasetid),
+        "class_name_key": {
+            "namespace": config["namespace"],
+            "name": config["class_name"],
+        },
+        "attributes": {
+            "MarkAsDeleted": 1,
+        },
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=cmdb_json_headers(token),
+        method="PATCH",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            detail = response.read().decode("utf-8", errors="replace")
+            return response.status, url, detail
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Soft mark-as-deleted failed: {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Soft mark-as-deleted failed: {exc.reason}") from exc
+
+
+def cmdb_delete_instance(config, token, datasetid, instanceid):
+    query = urlencode({"delete_option": config["delete_option"]})
+    url = f"{cmdb_instance_path(config, datasetid, instanceid)}?{query}"
+    req = urllib.request.Request(url, headers=cmdb_auth_headers(token), method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            detail = response.read().decode("utf-8", errors="replace")
+            return response.status, url, detail
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Delete failed: {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Delete failed: {exc.reason}") from exc
+
+
+def rows_as_dicts(columns, rows):
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def apply_addm_duplicate_resolution(form):
+    if form.get("confirm_cmdb_rest_apply", [""])[0] != "1":
+        raise RuntimeError("Confirm REST apply before updating duplicate CIs.")
+    rest_action = form.get("cmdb_rest_duplicate_action", ["soft_mark_deleted"])[0]
+    if rest_action not in {"soft_mark_deleted", "delete_instance"}:
+        rest_action = "soft_mark_deleted"
+    preview_sql = build_addm_duplicate_resolution_sql(form)
+    columns, rows = execute_sql(preview_sql)
+    candidates = [
+        row
+        for row in rows_as_dicts(columns, rows)
+        if str(row.get("resolution_status", "")) == "Selected For Deletion"
+        and str(row.get("markasdeleted", "0")) != "1"
+    ]
+    if not candidates:
+        return preview_sql, (
+            ["status", "detail"],
+            [("No selected active duplicate rows were found for the current rule.", "No REST calls were made.")],
+        )
+
+    config = checked_cmdb_rest_config()
+    token = cmdb_rest_login(config)
+    result_rows = []
+    for row in candidates:
+        datasetid = row.get("datasetid")
+        instanceid = row.get("instanceid")
+        try:
+            lookup_url, matches = cmdb_lookup_instance(config, token, datasetid, instanceid)
+            if len(matches) != 1:
+                result_rows.append(
+                    (
+                        datasetid,
+                        instanceid,
+                        row.get("serialnumber"),
+                        row.get("addmintegrationid"),
+                        len(matches),
+                        "Skipped",
+                        lookup_url,
+                        "Expected exactly one CMDB REST lookup match.",
+                    )
+                )
+                continue
+            if rest_action == "delete_instance":
+                status_code, update_url, detail = cmdb_delete_instance(config, token, datasetid, instanceid)
+                action_status = f"Deleted ({status_code})"
+            else:
+                status_code, update_url, detail = cmdb_soft_mark_instance_deleted(
+                    config, token, datasetid, instanceid
+                )
+                action_status = f"MarkAsDeleted set to 1 ({status_code})"
+            result_rows.append(
+                (
+                    datasetid,
+                    instanceid,
+                    row.get("serialnumber"),
+                    row.get("addmintegrationid"),
+                    len(matches),
+                    action_status,
+                    update_url,
+                    detail[:500],
+                )
+            )
+        except Exception as exc:
+            result_rows.append(
+                (
+                    datasetid,
+                    instanceid,
+                    row.get("serialnumber"),
+                    row.get("addmintegrationid"),
+                    "",
+                    "Failed",
+                    "",
+                    str(exc),
+                )
+            )
+    return preview_sql, (
+        [
+            "datasetid",
+            "instanceid",
+            "serialnumber",
+            "addmintegrationid",
+            "lookup_matches",
+            "status",
+            "rest_url",
+            "detail",
+        ],
+        result_rows,
+    )
+
+
 def dataset_options():
     _, rows = execute_sql(
         """
@@ -280,6 +624,20 @@ def ai_form_values():
         "anthropic_key_saved": bool(anthropic_key),
         "anthropic_model": os.getenv("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
         "cursor_model": os.getenv("CURSOR_MODEL", DEFAULT_CURSOR_MODEL),
+    }
+
+
+def rest_form_values():
+    password = os.getenv("CMDB_REST_PASSWORD", os.getenv("PGPASSWORD", ""))
+    return {
+        "cmdb_rest_base_url": os.getenv("CMDB_REST_BASE_URL", default_cmdb_rest_base_url()),
+        "cmdb_rest_username": os.getenv("CMDB_REST_USERNAME", os.getenv("PGUSER", "")),
+        "cmdb_rest_password_saved": bool(password),
+        "cmdb_rest_namespace": os.getenv("CMDB_REST_NAMESPACE", DEFAULT_CMDB_NAMESPACE),
+        "cmdb_rest_class": os.getenv("CMDB_REST_CLASS", DEFAULT_CMDB_CLASS),
+        "cmdb_rest_delete_option": normalize_cmdb_delete_option(
+            os.getenv("CMDB_REST_DELETE_OPTION", DEFAULT_CMDB_DELETE_OPTION)
+        ),
     }
 
 
@@ -644,68 +1002,158 @@ def validate_identifier(value, label):
     return cleaned
 
 
-def build_duplicate_cleanup_sql(form):
-    table_name = validate_identifier(form.get("dupe_table", ["bmc_core_bmc_baseelement"])[0], "Table name")
-    id_column = validate_identifier(form.get("dupe_id_column", ["instanceid"])[0], "ID column")
-    deleted_column = validate_identifier(form.get("dupe_deleted_column", ["markasdeleted"])[0], "Mark-as-deleted column")
-    date_column = validate_identifier(form.get("dupe_date_column", ["modifieddate"])[0], "Date column")
-    match_columns_raw = form.get("dupe_match_columns", [""])[0]
-    match_columns = [
-        validate_identifier(column, "Duplicate match column")
-        for column in match_columns_raw.replace(",", "\n").splitlines()
-        if column.strip()
-    ]
-    if not match_columns:
-        raise RuntimeError("Enter at least one duplicate match column.")
+def int_form_value(form, field, default, minimum=1, maximum=100000):
+    raw_value = form.get(field, [str(default)])[0] or str(default)
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{field} must be a number.") from exc
+    return max(minimum, min(maximum, value))
 
-    keep_mode = form.get("dupe_keep_mode", ["newest"])[0]
-    order_direction = "DESC" if keep_mode == "newest" else "ASC"
-    partition_cols = ", ".join(match_columns)
-    preview_cols = ", ".join([id_column, *match_columns, date_column])
 
-    preview_sql = f"""WITH ranked_dupes AS (
+def duplicate_group_columns(form):
+    group_mode = form.get("addm_group_mode", ["dataset_serial"])[0]
+    if group_mode == "dataset_addm":
+        return ["datasetid", "addmintegrationid"]
+    if group_mode == "dataset_serial_addm":
+        return ["datasetid", "serialnumber", "addmintegrationid"]
+    return ["datasetid", "serialnumber"]
+
+
+def build_addm_duplicate_resolution_sql(form):
+    table_name = validate_identifier(form.get("addm_table", ["bmc_core_bmc_baseelement"])[0], "Table name")
+    relationship_table = validate_identifier(
+        form.get("addm_relationship_table", ["bmc_core_bmc_baserelationship"])[0], "Relationship table"
+    )
+    id_column = validate_identifier(form.get("addm_id_column", ["instanceid"])[0], "Instance ID column")
+    dataset_column = validate_identifier(form.get("addm_dataset_column", ["datasetid"])[0], "Dataset column")
+    class_column = validate_identifier(form.get("addm_class_column", ["classid"])[0], "Class ID column")
+    name_column = validate_identifier(form.get("addm_name_column", ["name"])[0], "Name column")
+    serial_column = validate_identifier(form.get("addm_serial_column", ["serialnumber"])[0], "Serial number column")
+    addm_column = validate_identifier(
+        form.get("addm_integration_column", ["addmintegrationid"])[0], "ADDM integration column"
+    )
+    created_column = validate_identifier(form.get("addm_created_column", ["createdate"])[0], "Created date column")
+    modified_column = validate_identifier(form.get("addm_modified_column", ["modifieddate"])[0], "Modified date column")
+    lastscan_column = validate_identifier(form.get("addm_lastscan_column", ["lastscandate"])[0], "Last scan date column")
+    deleted_column = validate_identifier(form.get("addm_deleted_column", ["markasdeleted"])[0], "Mark-as-deleted column")
+    source_column = validate_identifier(form.get("addm_source_column", ["datasetid"])[0], "Discovery source column")
+    limit = int_form_value(form, "addm_limit", 500)
+
+    group_columns = duplicate_group_columns(form)
+    partition_cols = ", ".join(group_columns)
+    raw_blank_addm = f"(ci.{addm_column} IS NULL OR trim(ci.{addm_column}::text) = '')"
+    ranked_blank_addm = "(addmintegrationid IS NULL OR trim(addmintegrationid::text) = '')"
+    rule = form.get("addm_selection_rule", ["mark_newest_lastscan"])[0]
+
+    if rule == "mark_oldest_lastscan":
+        rank_order = "lastscandate ASC NULLS LAST, createdate ASC NULLS LAST, instanceid"
+        selected_condition = "delete_rank = 1"
+    elif rule == "mark_blank_addm":
+        rank_order = f"CASE WHEN {ranked_blank_addm} THEN 0 ELSE 1 END, lastscandate DESC NULLS LAST, instanceid"
+        selected_condition = "addm_integration_status = 'Blank ADDMIntegrationId'"
+    elif rule == "mark_fewest_relationships":
+        rank_order = "relationship_count ASC, lastscandate DESC NULLS LAST, instanceid"
+        selected_condition = "delete_rank = 1"
+    elif rule == "mark_all_except_oldest_created":
+        rank_order = "createdate ASC NULLS LAST, lastscandate ASC NULLS LAST, instanceid"
+        selected_condition = "delete_rank > 1"
+    elif rule == "mark_all_except_most_relationships":
+        rank_order = "relationship_count DESC, createdate ASC NULLS LAST, instanceid"
+        selected_condition = "delete_rank > 1"
+    else:
+        rank_order = "lastscandate DESC NULLS LAST, createdate DESC NULLS LAST, instanceid"
+        selected_condition = "delete_rank = 1"
+
+    return f"""WITH relationship_counts AS (
     SELECT
-        {preview_cols},
-        row_number() OVER (
-            PARTITION BY {partition_cols}
-            ORDER BY {date_column} {order_direction}, {id_column}
-        ) AS dupe_rank,
-        count(*) OVER (
-            PARTITION BY {partition_cols}
-        ) AS dupe_count
-    FROM {table_name}
-    WHERE coalesce({deleted_column}, 0) <> 1
-)
-SELECT *
-FROM ranked_dupes
-WHERE dupe_count > 1
-ORDER BY {partition_cols}, dupe_rank;"""
+        instanceid,
+        count(*) AS relationship_count
+    FROM (
+        SELECT
+            source_instanceid AS instanceid
+        FROM {relationship_table}
+        WHERE source_instanceid IS NOT NULL
 
-    update_sql = f"""WITH ranked_dupes AS (
-    SELECT
-        {id_column},
-        row_number() OVER (
-            PARTITION BY {partition_cols}
-            ORDER BY {date_column} {order_direction}, {id_column}
-        ) AS dupe_rank,
-        count(*) OVER (
-            PARTITION BY {partition_cols}
-        ) AS dupe_count
-    FROM {table_name}
-    WHERE coalesce({deleted_column}, 0) <> 1
+        UNION ALL
+
+        SELECT
+            destination_instanceid AS instanceid
+        FROM {relationship_table}
+        WHERE destination_instanceid IS NOT NULL
+    ) rel
+    GROUP BY instanceid
 ),
-dupes_to_mark AS (
-    SELECT {id_column}
-    FROM ranked_dupes
-    WHERE dupe_count > 1
-      AND dupe_rank > 1
+base AS (
+    SELECT
+        ci.{dataset_column} AS datasetid,
+        ci.{class_column} AS classid,
+        ci.{id_column} AS instanceid,
+        ci.{name_column} AS name,
+        ci.{serial_column} AS serialnumber,
+        ci.{addm_column} AS addmintegrationid,
+        ci.{source_column} AS discovery_source,
+        to_timestamp(ci.{created_column}) AS createdate,
+        to_timestamp(ci.{modified_column}) AS modifieddate,
+        to_timestamp(ci.{lastscan_column}) AS lastscandate,
+        coalesce(ci.{deleted_column}, 0) AS markasdeleted,
+        coalesce(rc.relationship_count, 0) AS relationship_count,
+        CASE
+            WHEN {raw_blank_addm} THEN 'Blank ADDMIntegrationId'
+            ELSE 'Has ADDMIntegrationId'
+        END AS addm_integration_status
+    FROM {table_name} ci
+    LEFT JOIN relationship_counts rc
+        ON rc.instanceid = ci.{id_column}
+),
+ranked AS (
+    SELECT
+        *,
+        count(*) OVER (
+            PARTITION BY {partition_cols}
+        ) AS group_total,
+        sum(CASE WHEN markasdeleted <> 1 THEN 1 ELSE 0 END) OVER (
+            PARTITION BY {partition_cols}
+        ) AS active_group_total,
+        row_number() OVER (
+            PARTITION BY {partition_cols}
+            ORDER BY
+                CASE WHEN markasdeleted = 1 THEN 1 ELSE 0 END,
+                {rank_order}
+        ) AS delete_rank
+    FROM base
+    WHERE {" AND ".join(f"{column} IS NOT NULL AND trim({column}::text) <> ''" for column in group_columns)}
+),
+duplicate_groups AS (
+    SELECT *
+    FROM ranked
+    WHERE group_total > 1
 )
-UPDATE {table_name} target
-SET {deleted_column} = 1
-FROM dupes_to_mark dupe
-WHERE target.{id_column} = dupe.{id_column};"""
-
-    return preview_sql, update_sql
+SELECT
+    datasetid,
+    classid,
+    instanceid,
+    name,
+    serialnumber,
+    addmintegrationid,
+    discovery_source,
+    createdate,
+    modifieddate,
+    lastscandate,
+    markasdeleted,
+    relationship_count,
+    group_total,
+    active_group_total,
+    delete_rank,
+    CASE
+        WHEN markasdeleted = 1 THEN 'Already Marked Deleted'
+        WHEN active_group_total <= 1 THEN 'Keep / Only Active CI'
+        WHEN {selected_condition} THEN 'Selected For Deletion'
+        ELSE 'Keep / Review'
+    END AS resolution_status
+FROM duplicate_groups
+ORDER BY {partition_cols}, resolution_status DESC, delete_rank
+LIMIT {limit};"""
 
 
 def query_params(form):
@@ -788,11 +1236,20 @@ def render_layout(body):
       margin: 0;
       padding: 18px 22px;
     }}
-    .grid {{
+    .page-stack {{
       display: grid;
-      grid-template-columns: 360px minmax(0, 1fr);
       gap: 18px;
+    }}
+    .cockpit-deck {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 14px;
       align-items: start;
+    }}
+    .query-panel {{
+      grid-column: span 2;
+    }}
+    .results-panel {{
       width: 100%;
     }}
     .panel {{
@@ -829,6 +1286,10 @@ def render_layout(body):
       background: white;
       color: var(--text);
     }}
+    input[type="checkbox"] {{
+      width: auto;
+      margin-right: 8px;
+    }}
     .saved-query-select {{
       min-height: 54px;
       border: 0;
@@ -841,6 +1302,13 @@ def render_layout(body):
     }}
     .saved-query-select:hover {{
       background: var(--accent-dark);
+    }}
+    .saved-query-label {{
+      color: var(--text);
+      font-family: Tahoma, Geneva, sans-serif;
+      font-size: 18px;
+      font-weight: 800;
+      text-transform: none;
     }}
     textarea {{
       min-height: 190px;
@@ -894,10 +1362,37 @@ def render_layout(body):
     button.danger:hover {{
       background: #832f2f;
     }}
+    button:disabled {{
+      background: #9aa6b2;
+      color: #eef2f7;
+      cursor: not-allowed;
+      box-shadow: none;
+    }}
+    button:disabled:hover {{
+      background: #9aa6b2;
+    }}
     .actions {{
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 10px;
+    }}
+    .query-fields {{
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) minmax(240px, 1.2fr);
+      gap: 14px;
+      align-items: start;
+    }}
+    .query-small-fields {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }}
+    .query-wide {{
+      grid-column: 1 / -1;
+    }}
+    .top-query-sql {{
+      height: 210px;
+      margin: 0;
     }}
     .hint {{
       color: var(--muted);
@@ -1066,7 +1561,10 @@ def render_layout(body):
       text-align: center;
     }}
     @media (max-width: 860px) {{
-      .grid {{ grid-template-columns: 1fr; }}
+      .query-panel {{ grid-column: auto; }}
+      .query-fields {{ grid-template-columns: 1fr; }}
+      .query-small-fields {{ grid-template-columns: 1fr; }}
+      .query-wide {{ grid-column: auto; }}
       main {{ padding: 14px; }}
       th, td {{ white-space: normal; }}
     }}
@@ -1187,6 +1685,63 @@ def render_connection_form(message=""):
 """
 
 
+def render_delete_option_select(selected):
+    selected = normalize_cmdb_delete_option(selected)
+    options = [
+        ("PURGE", "PURGE - physically delete the instance"),
+        ("MARK_AS_DELETED", "MARK_AS_DELETED - mark only"),
+    ]
+    option_html = [
+        f'<option value="{esc(value)}" {"selected" if value == selected else ""}>{esc(label)}</option>'
+        for value, label in options
+    ]
+    if selected and selected not in {value for value, _ in options}:
+        option_html.append(f'<option value="{esc(selected)}" selected>Custom ({esc(selected)})</option>')
+    return "\n".join(option_html)
+
+
+def render_rest_settings_form(message=""):
+    values = rest_form_values()
+    password_placeholder = (
+        "Saved password is set. Enter a new password to replace it."
+        if values["cmdb_rest_password_saved"]
+        else "AR password"
+    )
+    message_html = f'<div class="success">{esc(message)}</div>' if message else ""
+    return f"""
+<section class="panel">
+  <h2>CMDB REST Connection</h2>
+  <div class="panel-body">
+    {message_html}
+    <form method="post" action="/rest-settings">
+      <label for="cmdb_rest_base_url">CMDB REST Base URL</label>
+      <input id="cmdb_rest_base_url" name="cmdb_rest_base_url" value="{esc(values["cmdb_rest_base_url"])}">
+
+      <label for="cmdb_rest_username">AR User</label>
+      <input id="cmdb_rest_username" name="cmdb_rest_username" value="{esc(values["cmdb_rest_username"])}">
+
+      <label for="cmdb_rest_password">AR Password</label>
+      <input id="cmdb_rest_password" name="cmdb_rest_password" type="password" placeholder="{esc(password_placeholder)}">
+
+      <label for="cmdb_rest_namespace">CMDB Namespace</label>
+      <input id="cmdb_rest_namespace" name="cmdb_rest_namespace" value="{esc(values["cmdb_rest_namespace"])}">
+
+      <label for="cmdb_rest_class">CMDB Class</label>
+      <input id="cmdb_rest_class" name="cmdb_rest_class" value="{esc(values["cmdb_rest_class"])}">
+
+      <label for="cmdb_rest_delete_option">Delete Option For Hard Delete</label>
+      <select id="cmdb_rest_delete_option" name="cmdb_rest_delete_option">
+        {render_delete_option_select(values["cmdb_rest_delete_option"])}
+      </select>
+
+      <button type="submit">Save CMDB REST Connection</button>
+      <p class="hint">Saved locally to {esc(os.path.abspath(ENV_PATH))}. This is used only for CMDB REST login and duplicate apply.</p>
+    </form>
+  </div>
+</section>
+"""
+
+
 def render_ssl_options(selected):
     options = ["prefer", "require", "disable", "allow", "verify-ca", "verify-full"]
     return "\n".join(
@@ -1197,6 +1752,7 @@ def render_ssl_options(selected):
 
 def render_query_form(selected_key, params):
     catalog = query_catalog()
+    meta = catalog[selected_key]
     options = "\n".join(
         f'<option value="{esc(key)}" {"selected" if key == selected_key else ""}>{esc(meta["name"])}</option>'
         for key, meta in catalog.items()
@@ -1204,26 +1760,45 @@ def render_query_form(selected_key, params):
     dataset_select, dataset_hint = render_dataset_select(params["datasetids"])
     classes = "\n".join(params["classids"])
     return f"""
-<section class="panel">
+<section class="panel query-panel">
   <h2>Query</h2>
   <div class="panel-body">
     <form method="get" action="/">
-      <label for="query">Saved Query</label>
-      <select class="saved-query-select" id="query" name="query">{options}</select>
+      <div class="query-fields">
+        <div>
+          <label class="saved-query-label" for="query">Saved Query List</label>
+          <select class="saved-query-select" id="query" name="query">{options}</select>
+          <p class="hint">{esc(meta["description"])}</p>
+        </div>
 
-      <label for="datasetids">Datasets</label>
-      {dataset_select}
-      {dataset_hint}
+        <div>
+          <label for="datasetids">Datasets</label>
+          {dataset_select}
+          {dataset_hint}
+        </div>
 
-      <label for="hours">Recent Window, Hours</label>
-      <input id="hours" name="hours" type="number" min="1" value="{esc(params["hours"])}">
+        <div class="query-small-fields">
+          <div>
+            <label for="hours">Recent Window, Hours</label>
+            <input id="hours" name="hours" type="number" min="1" value="{esc(params["hours"])}">
+          </div>
 
-      <label for="limit">Row Limit</label>
-      <input id="limit" name="limit" type="number" min="1" max="100000" value="{esc(params["limit"])}">
+          <div>
+            <label for="limit">Row Limit</label>
+            <input id="limit" name="limit" type="number" min="1" max="100000" value="{esc(params["limit"])}">
+          </div>
+        </div>
 
-      <label for="classids">Class IDs</label>
-      <textarea id="classids" name="classids">{esc(classes)}</textarea>
+        <div class="query-wide">
+          <label for="classids">Class IDs</label>
+          <textarea id="classids" name="classids">{esc(classes)}</textarea>
+        </div>
 
+        <div class="query-wide">
+          <label>SQL Query</label>
+          <pre class="sql top-query-sql">{esc(meta["sql"].strip())}</pre>
+        </div>
+      </div>
       <button class="run-query-button" type="submit">
         <img class="run-query-icon" src="/assets/blackholesurfer-logo.jpg" alt="">
         <span>Run Query</span>
@@ -1411,46 +1986,99 @@ def render_package_form():
 """
 
 
-def render_duplicate_cleanup_form(preview_sql="", update_sql=""):
+def render_addm_duplicate_resolution_form(preview_sql=""):
     sql_html = ""
-    if preview_sql or update_sql:
+    if preview_sql:
         sql_html = f"""
-    <label>Preview Duplicates SQL</label>
+    <label>Preview SQL</label>
     <textarea class="report-sql" readonly>{esc(preview_sql)}</textarea>
-
-    <label>Mark Duplicates SQL</label>
-    <textarea class="report-sql" readonly>{esc(update_sql)}</textarea>
 """
     return f"""
 <section class="panel">
-  <h2>Duplicate Cleanup SQL</h2>
+  <h2>ADDM Duplicate Resolution Preview</h2>
   <div class="panel-body">
-    <form method="post" action="/duplicates/sql">
-      <label for="dupe_table">Table</label>
-      <input id="dupe_table" name="dupe_table" value="bmc_core_bmc_baseelement">
-
-      <label for="dupe_id_column">Unique ID Column</label>
-      <input id="dupe_id_column" name="dupe_id_column" value="instanceid">
-
-      <label for="dupe_deleted_column">Mark-As-Deleted Column</label>
-      <input id="dupe_deleted_column" name="dupe_deleted_column" value="markasdeleted">
-
-      <label for="dupe_match_columns">Duplicate Match Columns</label>
-      <textarea class="report-description" id="dupe_match_columns" name="dupe_match_columns">name
-serialnumber</textarea>
-
-      <label for="dupe_date_column">Sort Date Column</label>
-      <input id="dupe_date_column" name="dupe_date_column" value="modifieddate">
-
-      <label for="dupe_keep_mode">Record To Keep</label>
-      <select id="dupe_keep_mode" name="dupe_keep_mode">
-        <option value="newest">Keep newest, mark older duplicates</option>
-        <option value="oldest">Keep oldest, mark newer duplicates</option>
+    <form method="post" action="/duplicates/addm-preview">
+      <label for="addm_group_mode">Duplicate Grouping</label>
+      <select id="addm_group_mode" name="addm_group_mode">
+        <option value="dataset_serial">Dataset + SerialNumber</option>
+        <option value="dataset_addm">Dataset + ADDMIntegrationId</option>
+        <option value="dataset_serial_addm">Dataset + SerialNumber + ADDMIntegrationId</option>
       </select>
 
-      <button type="submit">Generate Cleanup SQL</button>
+      <label for="addm_selection_rule">Bulk Selection Rule</label>
+      <select id="addm_selection_rule" name="addm_selection_rule">
+        <option value="mark_newest_lastscan">Mark newest LastScanDate in each group</option>
+        <option value="mark_oldest_lastscan">Mark oldest LastScanDate in each group</option>
+        <option value="mark_blank_addm">Mark active records with blank ADDMIntegrationId</option>
+        <option value="mark_fewest_relationships">Mark record with fewest relationships</option>
+        <option value="mark_all_except_oldest_created">Mark all except oldest CreatedDate</option>
+        <option value="mark_all_except_most_relationships">Mark all except most relationships</option>
+      </select>
+
+      <label for="addm_limit">Preview Row Limit</label>
+      <input id="addm_limit" name="addm_limit" type="number" min="1" max="100000" value="500">
+
+      <details class="sql-details">
+        <summary>Column Mapping</summary>
+        <div class="panel-body">
+          <label for="addm_table">CI Table</label>
+          <input id="addm_table" name="addm_table" value="bmc_core_bmc_baseelement">
+
+          <label for="addm_relationship_table">Relationship Table</label>
+          <input id="addm_relationship_table" name="addm_relationship_table" value="bmc_core_bmc_baserelationship">
+
+          <label for="addm_id_column">Instance ID Column</label>
+          <input id="addm_id_column" name="addm_id_column" value="instanceid">
+
+          <label for="addm_dataset_column">Dataset Column</label>
+          <input id="addm_dataset_column" name="addm_dataset_column" value="datasetid">
+
+          <label for="addm_class_column">Class ID Column</label>
+          <input id="addm_class_column" name="addm_class_column" value="classid">
+
+          <label for="addm_name_column">Name Column</label>
+          <input id="addm_name_column" name="addm_name_column" value="name">
+
+          <label for="addm_serial_column">SerialNumber Column</label>
+          <input id="addm_serial_column" name="addm_serial_column" value="serialnumber">
+
+          <label for="addm_integration_column">ADDMIntegrationId Column</label>
+          <input id="addm_integration_column" name="addm_integration_column" value="addmintegrationid">
+
+          <label for="addm_source_column">Discovery Source Column</label>
+          <input id="addm_source_column" name="addm_source_column" value="datasetid">
+
+          <label for="addm_created_column">CreatedDate Column</label>
+          <input id="addm_created_column" name="addm_created_column" value="createdate">
+
+          <label for="addm_modified_column">ModifiedDate Column</label>
+          <input id="addm_modified_column" name="addm_modified_column" value="modifieddate">
+
+          <label for="addm_lastscan_column">LastScanDate Column</label>
+          <input id="addm_lastscan_column" name="addm_lastscan_column" value="lastscandate">
+
+          <label for="addm_deleted_column">MarkAsDeleted Column</label>
+          <input id="addm_deleted_column" name="addm_deleted_column" value="markasdeleted">
+        </div>
+      </details>
+
+      <button type="submit">Preview Bulk Selection</button>
+      <p class="hint">Preview only. Updates will be applied through BMC CMDB REST API, not SQL.</p>
+
+      <label for="cmdb_rest_duplicate_action">CMDB REST Apply Action</label>
+      <select id="cmdb_rest_duplicate_action" name="cmdb_rest_duplicate_action">
+        <option value="soft_mark_deleted">Soft mark only: set MarkAsDeleted to 1</option>
+        <option value="delete_instance">Delete CMDB instance through REST</option>
+      </select>
+      <p class="hint">Soft mark uses PATCH to update MarkAsDeleted. Delete uses the CMDB REST DELETE endpoint and the configured delete option.</p>
+
+      <label>
+        <input type="checkbox" name="confirm_cmdb_rest_apply" value="1">
+        Confirm REST apply for rows marked Selected For Deletion
+      </label>
+      <button class="danger" type="submit" formaction="/duplicates/addm-apply">Apply Selected Updates Through CMDB REST API</button>
+      <p class="hint">Apply uses the CMDB REST Connection panel credentials plus each selected row's DatasetId and InstanceId. SQL remains read-only for discovery and preview.</p>
     </form>
-    <p class="hint">This only generates SQL. Review the preview first, take a backup, and run the update manually only when you are sure.</p>
     {sql_html}
   </div>
 </section>
@@ -1476,9 +2104,20 @@ def render_table(columns, rows):
 """
 
 
-def render_page(query_key, params, error=None, result=None, message="", dupe_preview_sql="", dupe_update_sql=""):
+def render_page(
+    query_key,
+    params,
+    error=None,
+    result=None,
+    message="",
+    addm_preview_sql="",
+    result_title=None,
+    result_description=None,
+    result_sql=None,
+):
     catalog = query_catalog()
     meta = catalog[query_key]
+    display_title = result_title or meta["name"]
     config = db_config()
     db_label = f'{config["user"]}@{config["host"]}:{config["port"]}/{config["dbname"] or "(no database)"}'
 
@@ -1497,25 +2136,21 @@ def render_page(query_key, params, error=None, result=None, message="", dupe_pre
     else:
         result_html = '<div class="empty">Choose a query and run it.</div>'
 
+    connection_message = message if not message.startswith("CMDB REST") else ""
+    rest_message = message if message.startswith("CMDB REST") else ""
     body = f"""
-<div class="grid">
-  <div class="stack">
-    {render_connection_form(message)}
+<div class="page-stack">
+  <div class="cockpit-deck">
     {render_query_form(query_key, params)}
+    {render_connection_form(connection_message)}
+    {render_rest_settings_form(rest_message)}
     {render_report_form(query_key)}
     {render_ai_generator_form()}
-    {render_duplicate_cleanup_form(dupe_preview_sql, dupe_update_sql)}
+    {render_addm_duplicate_resolution_form(addm_preview_sql)}
     {render_package_form()}
   </div>
-  <section class="panel">
-    <h2>{esc(meta["name"])}</h2>
-    <details class="sql-details">
-      <summary>SQL Query</summary>
-      <div class="panel-body">
-        <p class="hint">{esc(meta["description"])}</p>
-        <pre class="sql">{esc(meta["sql"].strip())}</pre>
-      </div>
-    </details>
+  <section class="panel results-panel">
+    <h2>{esc(display_title)} Results</h2>
     {result_html}
   </section>
 </div>
@@ -1534,6 +2169,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             save_db_settings(form)
             self.send_response(303)
             self.send_header("Location", "/?saved=connection")
+            self.end_headers()
+            return
+
+        if parsed.path == "/rest-settings":
+            save_rest_settings(form)
+            self.send_response(303)
+            self.send_header("Location", "/?saved=rest")
             self.end_headers()
             return
 
@@ -1577,17 +2219,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if parsed.path == "/duplicates/sql":
+        if parsed.path == "/duplicates/addm-preview":
             query_key = selected_query_key(f"{BUILTIN_PREFIX}ci_by_class")
             params = query_params({})
             error = None
             result = None
-            message = "Duplicate cleanup SQL generated. Review carefully before running."
+            message = "ADDM duplicate resolution preview generated. No CMDB rows were updated."
             preview_sql = ""
-            update_sql = ""
             try:
-                preview_sql, update_sql = build_duplicate_cleanup_sql(form)
-                result = run_query(query_key, params)
+                preview_sql = build_addm_duplicate_resolution_sql(form)
+                result = execute_sql(preview_sql)
             except Exception as exc:
                 error = str(exc)
             page = render_page(
@@ -1596,8 +2237,40 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 error=error,
                 result=result,
                 message=message,
-                dupe_preview_sql=preview_sql,
-                dupe_update_sql=update_sql,
+                addm_preview_sql=preview_sql,
+                result_title="ADDM Duplicate Resolution Preview",
+                result_description="Bulk duplicate selection preview with MarkAsDeleted visibility. Preview only.",
+                result_sql=preview_sql,
+            )
+            encoded = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+
+        if parsed.path == "/duplicates/addm-apply":
+            query_key = selected_query_key(f"{BUILTIN_PREFIX}ci_by_class")
+            params = query_params({})
+            error = None
+            result = None
+            message = "CMDB REST duplicate resolution completed. Review each row for success or failure."
+            preview_sql = ""
+            try:
+                preview_sql, result = apply_addm_duplicate_resolution(form)
+            except Exception as exc:
+                error = str(exc)
+            page = render_page(
+                query_key,
+                params,
+                error=error,
+                result=result,
+                message=message,
+                addm_preview_sql=preview_sql,
+                result_title="CMDB REST Duplicate Resolution",
+                result_description="Bulk duplicate resolution results from CMDB REST API.",
+                result_sql=preview_sql,
             )
             encoded = page.encode("utf-8")
             self.send_response(200)
@@ -1640,6 +2313,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         message = ""
         if form.get("saved", [""])[0] == "connection":
             message = "Connection settings saved. Run a query to test them."
+        elif form.get("saved", [""])[0] == "rest":
+            message = "CMDB REST connection settings saved."
         elif form.get("saved", [""])[0] == "report":
             message = "Report saved."
         elif form.get("saved", [""])[0] == "report_deleted":
