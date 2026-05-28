@@ -1321,10 +1321,19 @@ def render_layout(body):
       padding: 18px 24px;
     }}
     header h1 {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
       margin: 0;
       font-size: 22px;
       font-weight: 650;
       letter-spacing: 0;
+    }}
+    .header-logo {{
+      display: block;
+      height: 28px;
+      width: auto;
+      flex: 0 0 auto;
     }}
     main {{
       width: 100%;
@@ -1744,7 +1753,7 @@ def render_layout(body):
   </script>
 </head>
 <body>
-  <header><h1>{APP_TITLE}</h1></header>
+  <header><h1><img class="header-logo" src="/assets/2024-bmc-helix-reversed.png" alt="BMC Helix">{APP_TITLE}</h1></header>
   <main>{body}</main>
 </body>
 </html>"""
