@@ -437,6 +437,100 @@ def safe_filename(value, fallback="cmdb-query-results"):
     return cleaned[:80] or fallback
 
 
+PRODUCT_CATALOG_FORM = "PCT:Product Catalog"
+PRODUCT_CATALOG_FIELDS = [
+    "Manufacturer",
+    "Product Name",
+    "Product Categorization Tier 1",
+    "Product Categorization Tier 2",
+    "Product Categorization Tier 3",
+    "Model/Version",
+    "Market Version",
+]
+PRODUCT_CATALOG_FIELD_ALIASES = {
+    "Manufacturer": ["Manufacturer", "ManufacturerName", "manufacturername", "manufacturer"],
+    "Product Name": ["Product Name", "ProductName", "product_name", "name"],
+    "Product Categorization Tier 1": [
+        "Product Categorization Tier 1",
+        "ProductCategorizationTier1",
+        "product_categorization_tier_1",
+        "category",
+    ],
+    "Product Categorization Tier 2": [
+        "Product Categorization Tier 2",
+        "ProductCategorizationTier2",
+        "product_categorization_tier_2",
+        "Type",
+        "type",
+    ],
+    "Product Categorization Tier 3": [
+        "Product Categorization Tier 3",
+        "ProductCategorizationTier3",
+        "product_categorization_tier_3",
+        "item",
+    ],
+    "Model/Version": ["Model/Version", "ModelVersion", "model_version", "model"],
+    "Market Version": ["Market Version", "MarketVersion", "market_version", "version", "Version"],
+}
+
+
+def normalize_column_name(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+
+def product_catalog_column_map(columns):
+    normalized_columns = {normalize_column_name(column): index for index, column in enumerate(columns)}
+    field_map = {}
+    missing = []
+    for field_name in PRODUCT_CATALOG_FIELDS:
+        index = None
+        for alias in PRODUCT_CATALOG_FIELD_ALIASES[field_name]:
+            index = normalized_columns.get(normalize_column_name(alias))
+            if index is not None:
+                break
+        if index is None:
+            missing.append(field_name)
+        else:
+            field_map[field_name] = index
+    if missing:
+        raise RuntimeError(
+            "Product Catalog JSON export needs result columns for: "
+            + ", ".join(missing)
+            + ". Use aliases matching the Product Catalog field names or common names such as ManufacturerName, category, Type, item, model, and MarketVersion."
+        )
+    return field_map
+
+
+def clean_json_value(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def build_product_catalog_payload(columns, rows, report_name):
+    field_map = product_catalog_column_map(columns)
+    entries = []
+    skipped_rows = 0
+    for row in rows:
+        values = {field_name: clean_json_value(row[index]) for field_name, index in field_map.items()}
+        if all(values.values()):
+            entries.append({"values": values})
+        else:
+            skipped_rows += 1
+
+    return {
+        "formName": PRODUCT_CATALOG_FORM,
+        "endpoint": f"/api/arsys/v1/entry/{quote(PRODUCT_CATALOG_FORM, safe='')}",
+        "sourceReport": report_name,
+        "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "requiredFields": PRODUCT_CATALOG_FIELDS,
+        "totalRows": len(rows),
+        "exportedRows": len(entries),
+        "skippedRows": skipped_rows,
+        "entries": entries,
+    }
+
+
 def cmdb_rest_config():
     return {
         "base_url": os.getenv("CMDB_REST_BASE_URL", default_cmdb_rest_base_url()).rstrip("/"),
@@ -2252,11 +2346,13 @@ def render_page(
     elif result:
         columns, rows = result
         export_href = f"/results/export?{result_export_query(query_key, params)}"
+        product_catalog_href = f"/product-catalog/export-json?{result_export_query(query_key, params)}"
         result_html = (
             f'<div class="panel-body"><div class="status">'
             f'<span class="pill">{esc(len(rows))} rows</span>'
             f'<span class="pill">{esc(db_label)}</span>'
             f'<a class="pill export-pill" href="{esc(export_href)}">Export Spreadsheet</a>'
+            f'<a class="pill export-pill" href="{esc(product_catalog_href)}">Export PCT JSON</a>'
             f"</div></div>"
             + render_table(columns, rows)
         )
@@ -2430,6 +2526,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "Content-Type",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as exc:
+                payload = str(exc).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            return
+
+        if parsed.path == "/product-catalog/export-json":
+            form = parse_qs(parsed.query)
+            query_key = selected_query_key(form.get("query", [f"{BUILTIN_PREFIX}ci_by_class"])[0])
+            params = query_params(form)
+            try:
+                columns, rows = run_query(query_key, params)
+                report_name = query_catalog()[query_key]["name"]
+                payload = json.dumps(
+                    build_product_catalog_payload(columns, rows, report_name),
+                    indent=2,
+                    sort_keys=True,
+                ).encode("utf-8")
+                filename = f"{safe_filename(report_name)}-pct-product-catalog.json"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()

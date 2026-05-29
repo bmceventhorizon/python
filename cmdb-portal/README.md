@@ -53,6 +53,8 @@ Saved reports must remain read-only SQL. Duplicate updates are applied through C
 
 After running a query, use **Export Spreadsheet** above the results table to download the current result set as an `.xlsx` file.
 
+Use **Export PCT JSON** to download Product Catalog create payloads for `PCT:Product Catalog`. The export keeps only rows where all seven required fields have values: `Manufacturer`, `Product Name`, `Product Categorization Tier 1`, `Product Categorization Tier 2`, `Product Categorization Tier 3`, `Model/Version`, and `Market Version`.
+
 ## Report Packages
 
 Use **Report Packages** in the browser to export saved reports as a JSON package or import reports from a package.

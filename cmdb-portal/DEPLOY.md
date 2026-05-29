@@ -130,6 +130,22 @@ That file is intentionally excluded from the install package by default. If you 
 
 After running a query, users can click **Export Spreadsheet** above the results table to download the current result set as an `.xlsx` file. The export reruns the selected query with the same filters before streaming the workbook to the browser.
 
+Users can also click **Export PCT JSON** to create REST-ready payloads for `PCT:Product Catalog`. The JSON export reruns the selected query, keeps only rows where the seven Product Catalog fields are populated, and writes an `entries` array where each item is shaped like:
+
+```json
+{
+  "values": {
+    "Manufacturer": "HP",
+    "Product Name": "LaserJet Enterprise 500 MFP M525f",
+    "Product Categorization Tier 1": "Hardware",
+    "Product Categorization Tier 2": "Printer",
+    "Product Categorization Tier 3": "Multifunction Printer",
+    "Model/Version": "M525f",
+    "Market Version": "M525f"
+  }
+}
+```
+
 ## Report Packages
 
 Use **Report Packages** in the browser to distribute SQL reports separately from the app.
