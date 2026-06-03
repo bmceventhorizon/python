@@ -1414,6 +1414,12 @@ def render_layout(body):
       color: white;
       padding: 18px 24px;
     }}
+    .header-bar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }}
     header h1 {{
       display: flex;
       align-items: center;
@@ -1428,6 +1434,22 @@ def render_layout(body):
       height: 28px;
       width: auto;
       flex: 0 0 auto;
+    }}
+    .portal-switch {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+      padding: 7px 12px;
+      border: 1px solid rgba(255, 255, 255, 0.4);
+      border-radius: 6px;
+      color: white;
+      font-weight: 700;
+      text-decoration: none;
+      white-space: nowrap;
+    }}
+    .portal-switch:hover {{
+      background: rgba(255, 255, 255, 0.12);
     }}
     main {{
       width: 100%;
@@ -1773,6 +1795,7 @@ def render_layout(body):
       .query-fields {{ grid-template-columns: 1fr; }}
       .query-small-fields {{ grid-template-columns: 1fr; }}
       .query-wide {{ grid-column: auto; }}
+      .header-bar {{ align-items: flex-start; flex-direction: column; }}
       main {{ padding: 14px; }}
       th, td {{ white-space: normal; }}
     }}
@@ -1847,7 +1870,12 @@ def render_layout(body):
   </script>
 </head>
 <body>
-  <header><h1><img class="header-logo" src="/assets/2024-bmc-helix-reversed.png" alt="BMC Helix">{APP_TITLE}</h1></header>
+  <header>
+    <div class="header-bar">
+      <h1><img class="header-logo" src="/assets/2024-bmc-helix-reversed.png" alt="BMC Helix">{APP_TITLE}</h1>
+      <a class="portal-switch" href="{esc(os.getenv("CMDB_REST_PORTAL_URL", "http://127.0.0.1:8010"))}">REST Portal</a>
+    </div>
+  </header>
   <main>{body}</main>
 </body>
 </html>"""
