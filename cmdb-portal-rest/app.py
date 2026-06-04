@@ -22,6 +22,41 @@ DEFAULT_NAMESPACE = "BMC.CORE"
 DEFAULT_DATASETS = ["BMC.ASSET"]
 DEFAULT_PAGE_SIZE = 500
 DEFAULT_MAX_ROWS = 5000
+PRODUCT_CATALOG_DATASET = "BMC.AddToProductCatalog"
+BASE_ELEMENT_CLASS = "BMC_BaseElement"
+SYSTEM_MANAGED_ATTRIBUTE_KEYS = {
+    "attributedatasourcelist",
+    "classid",
+    "cmdbrowlevelsecurity",
+    "cmdbrowlevelsecurityparent",
+    "cmdbwritesecurity",
+    "cmdbwritesecurityparent",
+    "compareactioncode",
+    "createdate",
+    "datasetid",
+    "deleteinstancetrigger",
+    "dsouniqueid",
+    "failedautomaticidentification",
+    "instanceid",
+    "lastrejobrunid",
+    "lastupdateddatasetid",
+    "lastmodifiedby",
+    "markasdeleted",
+    "modifieddate",
+    "normalizationstatus",
+    "reconciliationidentity",
+    "requestid",
+    "requestidentifier",
+    "readsecurity",
+    "referenceinstance",
+    "relleadclassid",
+    "relleadinstanceid",
+    "rowlevelsecurity",
+    "submitter",
+    "tokenid",
+    "writesecurity",
+}
+SYSTEM_MANAGED_ATTRIBUTE_PREFIXES = ("reconciliation", "z1d", "zcmdbeng", "ztmp")
 DEFAULT_CLASSES = [
     "BMC_PhysicalLink",
     "BMC_NetworkAddress",
@@ -75,6 +110,16 @@ REPORTS = {
         "name": "Normalization Summary",
         "description": "Groups CIs by NormalizationStatus and product categorization fields.",
         "definition": "GET BMC_BaseElement, then group normalization fields locally.",
+    },
+    "normalization_candidates": {
+        "name": "Normalization Candidates",
+        "description": "Lists individual CIs from the selected classes that can be copied into BMC.AddToProductCatalog for normalization.",
+        "definition": "GET each selected CMDB class, then copy a selected CI to BMC.AddToProductCatalog through POST /api/cmdb/v1.0/instances.",
+    },
+    "normalization_company_summary": {
+        "name": "Normalization and Company Summary",
+        "description": "Groups all BaseElement CIs in the selected datasets and matches CI companies to COM:Company.",
+        "definition": "GET BMC_BaseElement + GET /api/arsys/v1/entry/COM:Company, then match and group locally.",
     },
 }
 
@@ -202,6 +247,10 @@ def class_path(config, datasetid, class_name, namespace=None):
     return "/".join(part.strip("/") for part in parts)
 
 
+def instance_path(config, datasetid, namespace, class_name, instanceid):
+    return f"{class_path(config, datasetid, class_name, namespace=namespace)}/{quote(str(instanceid), safe='')}"
+
+
 def parse_instances(payload):
     if isinstance(payload, dict):
         instances = payload.get("instances")
@@ -225,6 +274,18 @@ def parse_datasets(payload):
             return value
     if "id" in payload or "dataset_type" in payload:
         return [payload]
+    return []
+
+
+def parse_entries(payload):
+    if isinstance(payload, dict):
+        entries = payload.get("entries")
+        if isinstance(entries, list):
+            return entries
+        if isinstance(payload.get("values"), dict):
+            return [payload]
+    if isinstance(payload, list):
+        return payload
     return []
 
 
@@ -295,6 +356,53 @@ def fetch_all_instances(config, token, datasetids, class_name, qualification="",
     return instances, urls
 
 
+def fetch_instance(config, token, datasetid, namespace, class_name, instanceid):
+    url = instance_path(config, datasetid, namespace, class_name, instanceid)
+    req = urllib.request.Request(url, headers=auth_headers(token), method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"CMDB source CI lookup failed: {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"CMDB source CI lookup failed: {exc.reason}") from exc
+    instances = parse_instances(payload)
+    if len(instances) != 1:
+        raise RuntimeError(f"Expected one source CI but found {len(instances)}.")
+    return instances[0], url
+
+
+def fetch_all_ar_entries(config, token, form_name, fields=None):
+    entries = []
+    offset = 0
+    while len(entries) < config["max_rows"]:
+        remaining = config["max_rows"] - len(entries)
+        limit = min(config["page_size"], remaining)
+        query = {
+            "limit": str(limit),
+            "offset": str(offset),
+        }
+        if fields:
+            query["fields"] = f"values({','.join(fields)})"
+        url = f'{config["base_url"]}/api/arsys/v1/entry/{quote(form_name, safe="")}?{urlencode(query)}'
+        req = urllib.request.Request(url, headers=auth_headers(token), method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=90) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"AR REST request failed for {form_name}: {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"AR REST request failed for {form_name}: {exc.reason}") from exc
+        page = parse_entries(payload)
+        entries.extend(page)
+        if len(page) < limit:
+            break
+        offset += limit
+    return entries
+
+
 def normalize_key(value):
     return "".join(char for char in str(value).lower() if char.isalnum())
 
@@ -335,6 +443,19 @@ def dataset_id(instance):
         "datasetid",
         default=instance.get("_portal_datasetid", ""),
     )
+
+
+def class_name_key(instance):
+    value = instance.get("class_name_key", {}) if isinstance(instance, dict) else {}
+    return value if isinstance(value, dict) else {}
+
+
+def instance_namespace(instance, default="BMC.CORE"):
+    return str(class_name_key(instance).get("namespace") or default)
+
+
+def instance_class_name(instance):
+    return str(class_name_key(instance).get("name") or row_value(instance, "ClassId") or "BMC_BaseElement")
 
 
 def row_value(instance, field_name):
@@ -422,6 +543,7 @@ BASE_FIELDS = [
     "Type",
     "Item",
     "NormalizationStatus",
+    "Company",
     "MarkAsDeleted",
     "ReconciliationIdentity",
 ]
@@ -552,6 +674,159 @@ def cmdb_mark_instance_deleted(config, token, instance):
         raise RuntimeError(f"MarkAsDeleted update failed: {exc.reason}") from exc
 
 
+def product_catalog_copy_attributes(instance):
+    copied = {}
+    for name, value in attributes(instance).items():
+        normalized_name = normalize_key(name)
+        if normalized_name in SYSTEM_MANAGED_ATTRIBUTE_KEYS or normalized_name.startswith(
+            SYSTEM_MANAGED_ATTRIBUTE_PREFIXES
+        ):
+            continue
+        if value is None:
+            continue
+        copied[name] = value
+    return copied
+
+
+def product_catalog_create_payload(instance, config):
+    source_class = instance_class_name(instance)
+    if normalize_key(source_class) == normalize_key(BASE_ELEMENT_CLASS):
+        raise RuntimeError(
+            "Cannot create a Product Catalog copy as BMC_BaseElement. Select the CI's concrete class."
+        )
+    copied_attributes = product_catalog_copy_attributes(instance)
+    if not copied_attributes.get("Name") and row_value(instance, "Name"):
+        copied_attributes["Name"] = row_value(instance, "Name")
+    if not copied_attributes:
+        raise RuntimeError("The source CI has no copyable attributes.")
+    return {
+        "instances": [
+            {
+                "class_name_key": {
+                    "namespace": instance_namespace(instance, config["namespace"]),
+                    "name": source_class,
+                },
+                "dataset_id": PRODUCT_CATALOG_DATASET,
+                "attributes": copied_attributes,
+            }
+        ]
+    }
+
+
+def created_instance_reference(detail, source, config):
+    try:
+        payload = json.loads(detail)
+    except (TypeError, ValueError):
+        return None
+    created_instances = parse_instances(payload)
+    created = created_instances[0] if created_instances else payload if isinstance(payload, dict) else {}
+    created_id = instance_id(created)
+    if not created_id and isinstance(payload, dict):
+        instance_ids = payload.get("instance_ids") or payload.get("instanceIds")
+        if isinstance(instance_ids, list) and instance_ids:
+            created_id = instance_ids[0]
+    if not created_id:
+        return None
+    created_key = class_name_key(created)
+    created_class = created_key.get("name") or row_value(created, "ClassId") or instance_class_name(source)
+    return {
+        "datasetid": str(dataset_id(created) or PRODUCT_CATALOG_DATASET),
+        "namespace": instance_namespace(created, instance_namespace(source, config["namespace"])),
+        "class_name": str(created_class),
+        "instanceid": str(created_id),
+    }
+
+
+def verify_created_instance(config, token, reference):
+    last_error = ""
+    for attempt in range(3):
+        if attempt:
+            time.sleep(attempt * 0.5)
+        try:
+            instance, url = fetch_instance(
+                config,
+                token,
+                reference["datasetid"],
+                reference["namespace"],
+                reference["class_name"],
+                reference["instanceid"],
+            )
+            return instance, url, ""
+        except Exception as exc:
+            last_error = str(exc)
+    return None, "", last_error
+
+
+def create_product_catalog_copy(form):
+    if form.get("confirm_product_catalog_add", [""])[0] != "1":
+        raise RuntimeError("Confirm adding the CI to BMC.AddToProductCatalog.")
+    source_dataset = form.get("source_datasetid", [""])[0].strip()
+    source_namespace = form.get("source_namespace", ["BMC.CORE"])[0].strip() or "BMC.CORE"
+    source_class = form.get("source_class_name", ["BMC_BaseElement"])[0].strip() or "BMC_BaseElement"
+    source_instanceid = form.get("source_instanceid", [""])[0].strip()
+    if not source_dataset or not source_instanceid:
+        raise RuntimeError("Source DatasetId and InstanceId are required.")
+    if source_dataset.lower() == PRODUCT_CATALOG_DATASET.lower():
+        raise RuntimeError(f"{PRODUCT_CATALOG_DATASET} cannot be used as its own source dataset.")
+    if normalize_key(source_class) == normalize_key(BASE_ELEMENT_CLASS):
+        raise RuntimeError(
+            "BMC_BaseElement is not a valid source class for this action. Select the CI's concrete class."
+        )
+
+    config = checked_rest_config()
+    token = cmdb_login(config)
+    source, source_url = fetch_instance(
+        config,
+        token,
+        source_dataset,
+        source_namespace,
+        source_class,
+        source_instanceid,
+    )
+    payload = product_catalog_create_payload(source, config)
+    url = f'{config["base_url"]}/api/cmdb/v1.0/instances'
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=cmdb_json_headers(token),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            detail = response.read().decode("utf-8", errors="replace")
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Create CI failed: {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Create CI failed: {exc.reason}") from exc
+    created_reference = created_instance_reference(detail, source, config)
+    verified_instance = None
+    verification_url = ""
+    verification_error = ""
+    if created_reference:
+        verified_instance, verification_url, verification_error = verify_created_instance(
+            config,
+            token,
+            created_reference,
+        )
+    else:
+        verification_error = "Create response did not include a target InstanceId."
+    return {
+        "status": status,
+        "source_url": source_url,
+        "create_url": url,
+        "source_name": row_value(source, "Name"),
+        "source_class": instance_class_name(source),
+        "attribute_count": len(payload["instances"][0]["attributes"]),
+        "detail": detail,
+        "created_reference": created_reference,
+        "verified": verified_instance is not None,
+        "verification_url": verification_url,
+        "verification_error": verification_error,
+    }
+
+
 def apply_duplicate_resolution(params):
     config, token, candidates = newest_duplicate_candidates(params)
     rows = []
@@ -607,6 +882,51 @@ def fetch_base(params):
     selected = set(selected_classids)
     if selected:
         instances = [instance for instance in instances if str(row_value(instance, "ClassId")).upper() in selected]
+    return config, token, instances
+
+
+def fetch_all_base_elements(params):
+    config = checked_rest_config()
+    token = cmdb_login(config)
+    instances, _ = fetch_all_instances(
+        config,
+        token,
+        params["datasetids"],
+        "BMC_BaseElement",
+        attributes=BASE_FIELDS,
+    )
+    return config, token, instances
+
+
+def fetch_selected_class_instances(params):
+    config = checked_rest_config()
+    token = cmdb_login(config)
+    class_names = [str(value).strip() for value in params["classids"] if str(value).strip()]
+    class_names = [
+        class_name for class_name in class_names if normalize_key(class_name) != normalize_key(BASE_ELEMENT_CLASS)
+    ]
+    if not class_names:
+        raise RuntimeError("Normalization Candidates requires at least one concrete Class ID other than BMC_BaseElement.")
+    instances = []
+    seen = set()
+    for class_name in class_names:
+        if len(instances) >= config["max_rows"]:
+            break
+        class_instances, _ = fetch_all_instances(
+            config,
+            token,
+            params["datasetids"],
+            class_name,
+            attributes=BASE_FIELDS,
+        )
+        for instance in class_instances:
+            key = (dataset_id(instance), instance_id(instance))
+            if key in seen:
+                continue
+            seen.add(key)
+            instances.append(instance)
+            if len(instances) >= config["max_rows"]:
+                break
     return config, token, instances
 
 
@@ -776,8 +1096,7 @@ def report_relationship_summary(params):
     )
 
 
-def report_normalization_summary(params):
-    _, _, instances = fetch_base(params)
+def normalization_status_label(value):
     labels = {
         "10": "Other",
         "20": "Not Normalized",
@@ -787,11 +1106,20 @@ def report_normalization_summary(params):
         "60": "Normalized and Approved",
         "70": "Modified after last Normalization",
     }
+    status = str(value or "")
+    if status in labels:
+        return labels[status]
+    display_labels = {normalize_key(label): label for label in labels.values()}
+    return display_labels.get(normalize_key(status))
+
+
+def report_normalization_summary(params):
+    _, _, instances = fetch_base(params)
     counts = {}
     for instance in instances:
         status = str(row_value(instance, "NormalizationStatus") or "")
         key = (
-            labels.get(status, status or "(blank)"),
+            normalization_status_label(status) or status or "(blank)",
             row_value(instance, "ClassId"),
             row_value(instance, "Category"),
             row_value(instance, "Type"),
@@ -814,6 +1142,151 @@ def report_normalization_summary(params):
     ], rows[: params["limit"]]
 
 
+def report_normalization_candidates(params):
+    _, _, instances = fetch_selected_class_instances(params)
+    candidate_labels = {
+        "Not Normalized",
+        "Normalization Failed",
+        "Normalized but Not Approved",
+        "Modified after last Normalization",
+    }
+    rows = []
+    for instance in instances:
+        if str(dataset_id(instance)).lower() == PRODUCT_CATALOG_DATASET.lower():
+            continue
+        if normalize_key(instance_class_name(instance)) == normalize_key(BASE_ELEMENT_CLASS):
+            continue
+        status = normalization_status_label(row_value(instance, "NormalizationStatus"))
+        if status not in candidate_labels:
+            continue
+        rows.append(
+            (
+                dataset_id(instance),
+                instance_namespace(instance),
+                instance_class_name(instance),
+                instance_id(instance),
+                row_value(instance, "Name"),
+                status,
+                row_value(instance, "Category"),
+                row_value(instance, "Type"),
+                row_value(instance, "Item"),
+                row_value(instance, "Model"),
+                row_value(instance, "ManufacturerName"),
+                row_value(instance, "Company"),
+            )
+        )
+    rows.sort(key=lambda row: (str(row[5]), str(row[4]), str(row[0]), str(row[3])))
+    return [
+        "datasetid",
+        "namespace",
+        "class_name",
+        "instanceid",
+        "name",
+        "normalizationstatus",
+        "category",
+        "type",
+        "item",
+        "model",
+        "manufacturername",
+        "company",
+    ], rows[: params["limit"]]
+
+
+def entry_values(entry):
+    values = entry.get("values", {}) if isinstance(entry, dict) else {}
+    return values if isinstance(values, dict) else {}
+
+
+def entry_value(entry, *names, default=""):
+    values = entry_values(entry)
+    normalized = {normalize_key(key): value for key, value in values.items()}
+    for name in names:
+        if name in values:
+            return values[name]
+        key = normalize_key(name)
+        if key in normalized:
+            return normalized[key]
+    return default
+
+
+def company_match(companies, company):
+    company_lower = str(company or "").lower()
+    matches = []
+    for entry in companies:
+        description = entry_value(entry, "Description")
+        if not str(description or "").strip():
+            continue
+        company_name = entry_value(entry, "Company")
+        company_name_lower = str(company_name or "").lower()
+        description_lower = str(description or "").lower()
+        if (
+            company_name_lower == company_lower
+            or company_lower in description_lower
+            or company_name_lower in company_lower
+        ):
+            if company_name_lower == company_lower:
+                rank = 0
+            elif company_lower in description_lower:
+                rank = 1
+            else:
+                rank = 2
+            matches.append((rank, len(str(description)), entry))
+    if not matches:
+        return None
+    matches.sort(key=lambda match: (match[0], match[1]))
+    return matches[0][2]
+
+
+def report_normalization_company_summary(params):
+    config, token, instances = fetch_all_base_elements(params)
+    company_form = os.getenv("CMDB_REST_COMPANY_FORM", "COM:Company")
+    companies = fetch_all_ar_entries(
+        config,
+        token,
+        company_form,
+        fields=["Company", "Description", "Company Type"],
+    )
+    counts = {}
+    match_cache = {}
+    for instance in instances:
+        status = str(row_value(instance, "NormalizationStatus") or "")
+        source_company = pick_attr(instance, "Company", "company", default=None)
+        display_company = "- Global -" if source_company == "BMC Software" else source_company
+        cache_key = str(display_company or "").lower()
+        if cache_key not in match_cache:
+            match_cache[cache_key] = company_match(companies, display_company)
+        match = match_cache[cache_key]
+        manufacturer = pick_attr(instance, "ManufacturerName", "manufacturername", default=None)
+        key = (
+            normalization_status_label(status),
+            row_value(instance, "ClassId"),
+            row_value(instance, "Category"),
+            row_value(instance, "Type"),
+            row_value(instance, "Item"),
+            row_value(instance, "Model"),
+            "BMC_UNKNOWN" if manufacturer is None else manufacturer,
+            display_company,
+            entry_value(match, "Description") if match else None,
+            entry_value(match, "Company Type", "CompanyType", "company_type") if match else None,
+        )
+        counts[key] = counts.get(key, 0) + 1
+    rows = [(count, *key) for key, count in counts.items()]
+    rows.sort(key=lambda row: (-row[0],) + tuple(str(value) for value in row[1:]))
+    return [
+        "record_count",
+        "normalizationstatus",
+        "classid",
+        "category",
+        "type",
+        "item",
+        "model",
+        "manufacturername",
+        "company",
+        "com_company",
+        "companytype",
+    ], rows[: params["limit"]]
+
+
 REPORT_RUNNERS = {
     "ci_by_class": report_ci_by_class,
     "ci_inventory": report_ci_inventory,
@@ -821,6 +1294,8 @@ REPORT_RUNNERS = {
     "orphaned_cis": report_orphaned_cis,
     "relationship_summary": report_relationship_summary,
     "normalization_summary": report_normalization_summary,
+    "normalization_candidates": report_normalization_candidates,
+    "normalization_company_summary": report_normalization_company_summary,
 }
 
 
@@ -959,10 +1434,13 @@ def render_layout(body):
     button.secondary:hover {{ background:#3e4b58; }}
     button.danger {{ background:#a23b3b; }}
     button.danger:hover {{ background:#832f2f; }}
+    .inline-action {{ margin:0; }}
+    .inline-action button {{ width:auto; min-width:150px; margin:0; padding:7px 10px; white-space:nowrap; }}
     .actions {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
     .run-button {{ min-height:72px; display:flex; align-items:center; justify-content:center; gap:12px; font-size:18px; background:#05070c; border:1px solid #1e293b; }}
     .run-button img {{ width:92px; height:38px; object-fit:contain; border-radius:4px; }}
     .query-fields {{ display:grid; grid-template-columns:minmax(220px,1fr) minmax(240px,1.2fr); gap:14px; align-items:start; }}
+    .compact-field {{ max-width:180px; }}
     .query-wide {{ grid-column:1 / -1; }}
     .sql {{ background:#101820; color:#eef6ff; border-radius:8px; padding:13px; overflow:auto; font-size:12px; height:180px; }}
     .hint {{ color:var(--muted); font-size:12px; margin:8px 0 0; }}
@@ -971,10 +1449,14 @@ def render_layout(body):
     .export-pill {{ color:var(--accent); font-weight:700; text-decoration:none; }}
     .error {{ border:1px solid #e5b4b4; background:#fff7f7; color:var(--danger); border-radius:8px; padding:12px; white-space:pre-wrap; overflow:auto; }}
     .success {{ border:1px solid #a8d5b8; background:#f3fbf6; color:#23643b; border-radius:8px; padding:12px; margin-bottom:14px; }}
+    .warning {{ border:1px solid #e1c36a; background:#fffaf0; color:#725510; border-radius:8px; padding:12px; margin-bottom:14px; }}
     .table-wrap {{ height:680px; min-height:240px; overflow:auto; border-top:1px solid var(--line); resize:vertical; }}
     table {{ width:max-content; min-width:100%; border-collapse:collapse; background:white; font-size:13px; }}
     th,td {{ border-bottom:1px solid #e6ebf1; padding:8px 10px; text-align:left; vertical-align:top; white-space:nowrap; max-width:420px; overflow:hidden; text-overflow:ellipsis; }}
     th {{ position:sticky; top:0; background:#eef2f7; z-index:1; font-weight:700; }}
+    .sort-button {{ display:flex; align-items:center; gap:6px; width:100%; min-height:0; margin:0; padding:0; border:0; border-radius:0; background:transparent; color:inherit; font:inherit; text-align:left; }}
+    .sort-button:hover {{ background:transparent; color:var(--accent-dark); }}
+    .sort-indicator {{ color:var(--muted); font-size:11px; min-width:10px; }}
     .empty {{ color:var(--muted); padding:24px; text-align:center; }}
     @media (max-width:860px) {{ .query-panel {{ grid-column:auto; }} .query-fields {{ grid-template-columns:1fr; }} .header-bar {{ align-items:flex-start; flex-direction:column; }} main {{ padding:14px; }} th,td {{ white-space:normal; }} }}
   </style>
@@ -987,6 +1469,43 @@ def render_layout(body):
     </div>
   </header>
   <main>{body}</main>
+  <script>
+    function sortableValue(cell) {{
+      const value = cell.textContent.trim();
+      const number = Number(value.replace(/,/g, ""));
+      return value !== "" && Number.isFinite(number)
+        ? {{ kind: "number", value: number }}
+        : {{ kind: "text", value: value.toLocaleLowerCase() }};
+    }}
+
+    document.querySelectorAll("table[data-sortable='true']").forEach((table) => {{
+      table.querySelectorAll("th[data-sort-index]").forEach((header) => {{
+        const button = header.querySelector(".sort-button");
+        if (!button) return;
+        button.addEventListener("click", () => {{
+          const index = Number(header.dataset.sortIndex);
+          const direction = header.getAttribute("aria-sort") === "ascending" ? "descending" : "ascending";
+          const rows = Array.from(table.tBodies[0].rows);
+          rows.sort((left, right) => {{
+            const a = sortableValue(left.cells[index]);
+            const b = sortableValue(right.cells[index]);
+            const comparison = a.kind === "number" && b.kind === "number"
+              ? a.value - b.value
+              : String(a.value).localeCompare(String(b.value), undefined, {{ numeric: true, sensitivity: "base" }});
+            return direction === "ascending" ? comparison : -comparison;
+          }});
+          rows.forEach((row) => table.tBodies[0].appendChild(row));
+          table.querySelectorAll("th[data-sort-index]").forEach((other) => {{
+            other.removeAttribute("aria-sort");
+            const indicator = other.querySelector(".sort-indicator");
+            if (indicator) indicator.textContent = "";
+          }});
+          header.setAttribute("aria-sort", direction);
+          header.querySelector(".sort-indicator").textContent = direction === "ascending" ? "ASC" : "DESC";
+        }});
+      }});
+    }});
+  </script>
 </body>
 </html>"""
 
@@ -1065,15 +1584,15 @@ def render_query_form(report_key, params):
           <label for="report">Report</label>
           <select id="report" name="report">{options}</select>
           <p class="hint">{esc(report["description"])}</p>
+          <div class="compact-field">
+            <label for="limit">Row Limit</label>
+            <input id="limit" name="limit" type="number" min="1" max="100000" value="{esc(params["limit"])}">
+          </div>
         </div>
         <div>
           <label for="datasetids">Datasets</label>
           {dataset_select}
           {dataset_hint}
-        </div>
-        <div>
-          <label for="limit">Row Limit</label>
-          <input id="limit" name="limit" type="number" min="1" max="100000" value="{esc(params["limit"])}">
         </div>
         <div class="query-wide">
           <label for="classids">Class IDs</label>
@@ -1102,15 +1621,71 @@ def render_query_form(report_key, params):
 </section>"""
 
 
-def render_table(columns, rows):
+def hidden_input(name, value):
+    return f'<input type="hidden" name="{esc(name)}" value="{esc(value)}">'
+
+
+def render_product_catalog_action(columns, row, report_key, params):
+    values = dict(zip(columns, row))
+    hidden = "".join(
+        [
+            hidden_input("report", report_key),
+            hidden_input("datasetids", "\n".join(params["datasetids"])),
+            hidden_input("classids", "\n".join(params["classids"])),
+            hidden_input("limit", params["limit"]),
+            hidden_input("source_datasetid", values.get("datasetid", "")),
+            hidden_input("source_namespace", values.get("namespace", "BMC.CORE")),
+            hidden_input("source_class_name", values.get("class_name", "BMC_BaseElement")),
+            hidden_input("source_instanceid", values.get("instanceid", "")),
+            hidden_input("confirm_product_catalog_add", "1"),
+        ]
+    )
+    return (
+        '<form class="inline-action" method="post" action="/product-catalog/add">'
+        f"{hidden}"
+        '<button type="submit" onclick="return confirm(\'Create a copy of this CI in BMC.AddToProductCatalog?\')">'
+        "Add to Product Catalog"
+        "</button></form>"
+    )
+
+
+def render_table(columns, rows, report_key=None, params=None):
     if not rows:
         return '<div class="empty">No rows returned.</div>'
-    head = "".join(f"<th>{esc(column)}</th>" for column in columns)
-    body = "".join("<tr>" + "".join(f"<td>{esc(value)}</td>" for value in row) + "</tr>" for row in rows)
-    return f"""<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"""
+    include_product_action = report_key == "normalization_candidates" and params is not None
+    display_columns = (["action"] if include_product_action else []) + list(columns)
+    head = "".join(
+        (
+            f'<th data-sort-index="{index}"><button class="sort-button" type="button">'
+            f'<span>{esc(column)}</span><span class="sort-indicator" aria-hidden="true"></span>'
+            "</button></th>"
+        )
+        if column != "action"
+        else "<th>action</th>"
+        for index, column in enumerate(display_columns)
+    )
+    body_rows = []
+    for row in rows:
+        action = (
+            f"<td>{render_product_catalog_action(columns, row, report_key, params)}</td>"
+            if include_product_action
+            else ""
+        )
+        body_rows.append("<tr>" + action + "".join(f"<td>{esc(value)}</td>" for value in row) + "</tr>")
+    body = "".join(body_rows)
+    return f"""<div class="table-wrap"><table data-sortable="true"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"""
 
 
-def render_page(report_key, params, result=None, error=None, message="", result_title=None):
+def render_page(
+    report_key,
+    params,
+    result=None,
+    error=None,
+    message="",
+    result_title=None,
+    result_message="",
+    result_message_kind="success",
+):
     config = rest_config()
     result_html = ""
     if error:
@@ -1124,10 +1699,13 @@ def render_page(report_key, params, result=None, error=None, message="", result_
             f'<span class="pill">CMDB REST {esc(config["base_url"])}</span>'
             f'<a class="pill export-pill" href="{esc(href)}">Export Spreadsheet</a>'
             f"</div></div>"
-            + render_table(columns, rows)
+            + render_table(columns, rows, report_key=report_key, params=params)
         )
     else:
         result_html = '<div class="empty">Choose a REST report and run it.</div>'
+    if result_message:
+        banner_class = "success" if result_message_kind == "success" else "warning"
+        result_html = f'<div class="panel-body"><div class="{banner_class}">{esc(result_message)}</div></div>' + result_html
     body = f"""
 <div class="page-stack">
   <div class="deck">
@@ -1210,6 +1788,51 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if parsed.path == "/product-catalog/add":
+            report_key = selected_report(form.get("report", ["normalization_candidates"])[0])
+            params = query_params(form)
+            error = None
+            result = None
+            result_message = ""
+            result_message_kind = "success"
+            try:
+                create_result = create_product_catalog_copy(form)
+                created_reference = create_result["created_reference"]
+                if create_result["verified"]:
+                    result_message = (
+                        f'Confirmed: "{create_result["source_name"]}" was added to {PRODUCT_CATALOG_DATASET} '
+                        f'as {created_reference["class_name"]} InstanceId {created_reference["instanceid"]}. '
+                        "The CI is eligible for the next normalization job."
+                    )
+                else:
+                    result_message_kind = "warning"
+                    target_id = (
+                        f' Target InstanceId: {created_reference["instanceid"]}.'
+                        if created_reference
+                        else ""
+                    )
+                    result_message = (
+                        f'Create accepted for "{create_result["source_name"]}" (HTTP {create_result["status"]}), '
+                        f"but the portal could not verify the copy in {PRODUCT_CATALOG_DATASET}.{target_id} "
+                        f'Eligibility is not yet confirmed. Verification detail: {create_result["verification_error"]}'
+                    )
+                result = run_report(report_key, params)
+            except Exception as exc:
+                error = str(exc)
+            payload = render_page(
+                report_key,
+                params,
+                result=result,
+                error=error,
+                result_message=result_message,
+                result_message_kind=result_message_kind,
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if parsed.path == "/settings":
             try:
                 save_rest_settings(form)
@@ -1227,6 +1850,17 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path.startswith("/assets/"):
             self.serve_asset(parsed.path)
+            return
+        if parsed.path == "/datasets":
+            try:
+                payload = json.dumps({"datasets": fetch_regular_datasets()}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as exc:
+                self.send_text(str(exc), status=500)
             return
         form = parse_qs(parsed.query)
         report_key = selected_report(form.get("report", ["ci_by_class"])[0])
