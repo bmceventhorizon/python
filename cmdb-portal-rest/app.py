@@ -1391,7 +1391,7 @@ def report_computer_system_attribute_sources(params):
         "ci_name",
         "dataset",
         "attributedatasourcelist",
-        "attributedatasourcelist_fields",
+        "Precedence Contest Winner",
     ], rows[: params["limit"]]
 
 
