@@ -76,6 +76,11 @@ REPORTS = {
         "description": "Groups CIs by NormalizationStatus and product categorization fields.",
         "definition": "GET BMC_BaseElement, then group normalization fields locally.",
     },
+    "normalization_company_summary": {
+        "name": "Normalization and Company Summary",
+        "description": "Groups all BaseElement CIs in the selected datasets and matches CI companies to COM:Company.",
+        "definition": "GET BMC_BaseElement + GET /api/arsys/v1/entry/COM:Company, then match and group locally.",
+    },
 }
 
 
@@ -228,6 +233,18 @@ def parse_datasets(payload):
     return []
 
 
+def parse_entries(payload):
+    if isinstance(payload, dict):
+        entries = payload.get("entries")
+        if isinstance(entries, list):
+            return entries
+        if isinstance(payload.get("values"), dict):
+            return [payload]
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
 def cmdb_quote(value):
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
@@ -293,6 +310,36 @@ def fetch_all_instances(config, token, datasetids, class_name, qualification="",
                 break
             offset += limit
     return instances, urls
+
+
+def fetch_all_ar_entries(config, token, form_name, fields=None):
+    entries = []
+    offset = 0
+    while len(entries) < config["max_rows"]:
+        remaining = config["max_rows"] - len(entries)
+        limit = min(config["page_size"], remaining)
+        query = {
+            "limit": str(limit),
+            "offset": str(offset),
+        }
+        if fields:
+            query["fields"] = f"values({','.join(fields)})"
+        url = f'{config["base_url"]}/api/arsys/v1/entry/{quote(form_name, safe="")}?{urlencode(query)}'
+        req = urllib.request.Request(url, headers=auth_headers(token), method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=90) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"AR REST request failed for {form_name}: {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"AR REST request failed for {form_name}: {exc.reason}") from exc
+        page = parse_entries(payload)
+        entries.extend(page)
+        if len(page) < limit:
+            break
+        offset += limit
+    return entries
 
 
 def normalize_key(value):
@@ -422,6 +469,7 @@ BASE_FIELDS = [
     "Type",
     "Item",
     "NormalizationStatus",
+    "Company",
     "MarkAsDeleted",
     "ReconciliationIdentity",
 ]
@@ -610,6 +658,19 @@ def fetch_base(params):
     return config, token, instances
 
 
+def fetch_all_base_elements(params):
+    config = checked_rest_config()
+    token = cmdb_login(config)
+    instances, _ = fetch_all_instances(
+        config,
+        token,
+        params["datasetids"],
+        "BMC_BaseElement",
+        attributes=BASE_FIELDS,
+    )
+    return config, token, instances
+
+
 def fetch_relationships(config, token, datasetids):
     instances, _ = fetch_all_instances(config, token, datasetids, "BMC_BaseRelationship")
     return instances
@@ -776,8 +837,7 @@ def report_relationship_summary(params):
     )
 
 
-def report_normalization_summary(params):
-    _, _, instances = fetch_base(params)
+def normalization_status_label(value):
     labels = {
         "10": "Other",
         "20": "Not Normalized",
@@ -787,11 +847,20 @@ def report_normalization_summary(params):
         "60": "Normalized and Approved",
         "70": "Modified after last Normalization",
     }
+    status = str(value or "")
+    if status in labels:
+        return labels[status]
+    display_labels = {normalize_key(label): label for label in labels.values()}
+    return display_labels.get(normalize_key(status))
+
+
+def report_normalization_summary(params):
+    _, _, instances = fetch_base(params)
     counts = {}
     for instance in instances:
         status = str(row_value(instance, "NormalizationStatus") or "")
         key = (
-            labels.get(status, status or "(blank)"),
+            normalization_status_label(status) or status or "(blank)",
             row_value(instance, "ClassId"),
             row_value(instance, "Category"),
             row_value(instance, "Type"),
@@ -814,6 +883,101 @@ def report_normalization_summary(params):
     ], rows[: params["limit"]]
 
 
+def entry_values(entry):
+    values = entry.get("values", {}) if isinstance(entry, dict) else {}
+    return values if isinstance(values, dict) else {}
+
+
+def entry_value(entry, *names, default=""):
+    values = entry_values(entry)
+    normalized = {normalize_key(key): value for key, value in values.items()}
+    for name in names:
+        if name in values:
+            return values[name]
+        key = normalize_key(name)
+        if key in normalized:
+            return normalized[key]
+    return default
+
+
+def company_match(companies, company):
+    company_lower = str(company or "").lower()
+    matches = []
+    for entry in companies:
+        description = entry_value(entry, "Description")
+        if not str(description or "").strip():
+            continue
+        company_name = entry_value(entry, "Company")
+        company_name_lower = str(company_name or "").lower()
+        description_lower = str(description or "").lower()
+        if (
+            company_name_lower == company_lower
+            or company_lower in description_lower
+            or company_name_lower in company_lower
+        ):
+            if company_name_lower == company_lower:
+                rank = 0
+            elif company_lower in description_lower:
+                rank = 1
+            else:
+                rank = 2
+            matches.append((rank, len(str(description)), entry))
+    if not matches:
+        return None
+    matches.sort(key=lambda match: (match[0], match[1]))
+    return matches[0][2]
+
+
+def report_normalization_company_summary(params):
+    config, token, instances = fetch_all_base_elements(params)
+    company_form = os.getenv("CMDB_REST_COMPANY_FORM", "COM:Company")
+    companies = fetch_all_ar_entries(
+        config,
+        token,
+        company_form,
+        fields=["Company", "Description", "Company Type"],
+    )
+    counts = {}
+    match_cache = {}
+    for instance in instances:
+        status = str(row_value(instance, "NormalizationStatus") or "")
+        source_company = pick_attr(instance, "Company", "company", default=None)
+        display_company = "- Global -" if source_company == "BMC Software" else source_company
+        cache_key = str(display_company or "").lower()
+        if cache_key not in match_cache:
+            match_cache[cache_key] = company_match(companies, display_company)
+        match = match_cache[cache_key]
+        manufacturer = pick_attr(instance, "ManufacturerName", "manufacturername", default=None)
+        key = (
+            normalization_status_label(status),
+            row_value(instance, "ClassId"),
+            row_value(instance, "Category"),
+            row_value(instance, "Type"),
+            row_value(instance, "Item"),
+            row_value(instance, "Model"),
+            "BMC_UNKNOWN" if manufacturer is None else manufacturer,
+            display_company,
+            entry_value(match, "Description") if match else None,
+            entry_value(match, "Company Type", "CompanyType", "company_type") if match else None,
+        )
+        counts[key] = counts.get(key, 0) + 1
+    rows = [(count, *key) for key, count in counts.items()]
+    rows.sort(key=lambda row: (-row[0],) + tuple(str(value) for value in row[1:]))
+    return [
+        "record_count",
+        "normalizationstatus",
+        "classid",
+        "category",
+        "type",
+        "item",
+        "model",
+        "manufacturername",
+        "company",
+        "com_company",
+        "companytype",
+    ], rows[: params["limit"]]
+
+
 REPORT_RUNNERS = {
     "ci_by_class": report_ci_by_class,
     "ci_inventory": report_ci_inventory,
@@ -821,6 +985,7 @@ REPORT_RUNNERS = {
     "orphaned_cis": report_orphaned_cis,
     "relationship_summary": report_relationship_summary,
     "normalization_summary": report_normalization_summary,
+    "normalization_company_summary": report_normalization_company_summary,
 }
 
 
@@ -963,6 +1128,7 @@ def render_layout(body):
     .run-button {{ min-height:72px; display:flex; align-items:center; justify-content:center; gap:12px; font-size:18px; background:#05070c; border:1px solid #1e293b; }}
     .run-button img {{ width:92px; height:38px; object-fit:contain; border-radius:4px; }}
     .query-fields {{ display:grid; grid-template-columns:minmax(220px,1fr) minmax(240px,1.2fr); gap:14px; align-items:start; }}
+    .compact-field {{ max-width:180px; }}
     .query-wide {{ grid-column:1 / -1; }}
     .sql {{ background:#101820; color:#eef6ff; border-radius:8px; padding:13px; overflow:auto; font-size:12px; height:180px; }}
     .hint {{ color:var(--muted); font-size:12px; margin:8px 0 0; }}
@@ -1065,15 +1231,15 @@ def render_query_form(report_key, params):
           <label for="report">Report</label>
           <select id="report" name="report">{options}</select>
           <p class="hint">{esc(report["description"])}</p>
+          <div class="compact-field">
+            <label for="limit">Row Limit</label>
+            <input id="limit" name="limit" type="number" min="1" max="100000" value="{esc(params["limit"])}">
+          </div>
         </div>
         <div>
           <label for="datasetids">Datasets</label>
           {dataset_select}
           {dataset_hint}
-        </div>
-        <div>
-          <label for="limit">Row Limit</label>
-          <input id="limit" name="limit" type="number" min="1" max="100000" value="{esc(params["limit"])}">
         </div>
         <div class="query-wide">
           <label for="classids">Class IDs</label>
@@ -1227,6 +1393,17 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path.startswith("/assets/"):
             self.serve_asset(parsed.path)
+            return
+        if parsed.path == "/datasets":
+            try:
+                payload = json.dumps({"datasets": fetch_regular_datasets()}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as exc:
+                self.send_text(str(exc), status=500)
             return
         form = parse_qs(parsed.query)
         report_key = selected_report(form.get("report", ["ci_by_class"])[0])
