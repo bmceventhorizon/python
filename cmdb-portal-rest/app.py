@@ -1574,6 +1574,10 @@ def render_layout(body):
     .sort-button {{ display:flex; align-items:center; gap:6px; width:100%; min-height:0; margin:0; padding:0; border:0; border-radius:0; background:transparent; color:inherit; font:inherit; text-align:left; }}
     .sort-button:hover {{ background:transparent; color:var(--accent-dark); }}
     .sort-indicator {{ color:var(--muted); font-size:11px; min-width:10px; }}
+    .column-resizer {{ position:absolute; top:0; right:-4px; width:9px; height:100%; z-index:3; cursor:col-resize; user-select:none; touch-action:none; }}
+    .column-resizer::after {{ content:""; position:absolute; top:20%; bottom:20%; left:4px; width:1px; background:#aeb8c5; }}
+    .column-resizer:hover::after, body.column-resizing .column-resizer::after {{ background:var(--accent); width:2px; }}
+    body.column-resizing {{ cursor:col-resize; user-select:none; }}
     .filter-row th {{ background:#e4eaf3; padding:4px 6px; position:sticky; top:37px; z-index:1; }}
     .filter-row input, .filter-row select {{ width:100%; box-sizing:border-box; padding:3px 6px; font-size:12px; background:#fff; border:1px solid #c8d0dc; border-radius:3px; color:#1a202c; }}
     .filter-row input:focus, .filter-row select:focus {{ outline:none; border-color:#5a7fc9; }}
@@ -1624,6 +1628,46 @@ def render_layout(body):
           header.setAttribute("aria-sort", direction);
           header.querySelector(".sort-indicator").textContent = direction === "ascending" ? "ASC" : "DESC";
         }});
+      }});
+    }});
+
+    document.querySelectorAll("table[data-sortable='true']").forEach((table) => {{
+      table.querySelectorAll("th[data-sort-index]").forEach((header) => {{
+        const index = Number(header.dataset.sortIndex);
+        const resizer = document.createElement("span");
+        resizer.className = "column-resizer";
+        resizer.title = "Resize column";
+        resizer.setAttribute("aria-hidden", "true");
+        resizer.addEventListener("mousedown", (event) => {{
+          event.preventDefault();
+          event.stopPropagation();
+          const startX = event.clientX;
+          const startWidth = header.getBoundingClientRect().width;
+          const cells = Array.from(table.rows).map(row => row.cells[index]).filter(Boolean);
+          cells.forEach(cell => {{
+            const width = cell.getBoundingClientRect().width;
+            cell.style.width = `${{width}}px`;
+            cell.style.minWidth = `${{width}}px`;
+            cell.style.maxWidth = `${{width}}px`;
+          }});
+          document.body.classList.add("column-resizing");
+          const move = (moveEvent) => {{
+            const width = Math.max(70, startWidth + moveEvent.clientX - startX);
+            cells.forEach(cell => {{
+              cell.style.width = `${{width}}px`;
+              cell.style.minWidth = `${{width}}px`;
+              cell.style.maxWidth = `${{width}}px`;
+            }});
+          }};
+          const stop = () => {{
+            document.body.classList.remove("column-resizing");
+            document.removeEventListener("mousemove", move);
+            document.removeEventListener("mouseup", stop);
+          }};
+          document.addEventListener("mousemove", move);
+          document.addEventListener("mouseup", stop);
+        }});
+        header.appendChild(resizer);
       }});
     }});
 
@@ -1865,7 +1909,7 @@ def render_table(columns, rows, report_key=None, params=None):
         )
         body_rows.append("<tr>" + action + "".join(f"<td>{esc(value)}</td>" for value in row) + "</tr>")
     body = "".join(body_rows)
-    dropdown_cols = {"normalizationstatus", "classid", "manufacturername"}
+    dropdown_cols = {"normalizationstatus", "classid", "manufacturername", "dataset", "datasetid"}
     filter_cells = "".join(
         "<th></th>" if column == "action"
         else f'<th><select data-filter-col="{index}"><option value="">All</option></select></th>'
