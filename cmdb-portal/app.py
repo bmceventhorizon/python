@@ -31,6 +31,8 @@ DEFAULT_CMDB_REST_PORT = "8008"
 DEFAULT_CMDB_NAMESPACE = "BMC.CORE"
 DEFAULT_CMDB_CLASS = "BMC_BaseElement"
 DEFAULT_CMDB_DELETE_OPTION = "PURGE"
+DEFAULT_CMDB_PAGE_SIZE = 500
+DEFAULT_CMDB_MAX_ROWS = 5000
 AI_PROVIDERS = {
     "openai": "ChatGPT / OpenAI",
     "anthropic": "Claude / Anthropic",
@@ -622,6 +624,71 @@ def cmdb_parse_instances(payload):
     return []
 
 
+def cmdb_parse_datasets(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("datasets", "items", "data", "entries"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    if "id" in payload or "dataset_type" in payload:
+        return [payload]
+    return []
+
+
+def regular_dataset_type(value):
+    return str(value).strip().lower() in {"0", "regular"}
+
+
+def dataset_value(dataset, *keys):
+    for key in keys:
+        if key in dataset and dataset[key] is not None:
+            return dataset[key]
+    return None
+
+
+def cmdb_regular_datasets():
+    config = checked_cmdb_rest_config()
+    token = cmdb_rest_login(config)
+    datasets = []
+    offset = 0
+    while len(datasets) < DEFAULT_CMDB_MAX_ROWS:
+        limit = min(DEFAULT_CMDB_PAGE_SIZE, DEFAULT_CMDB_MAX_ROWS - len(datasets))
+        query = urlencode(
+            {
+                "offset": str(offset),
+                "limit": str(limit),
+                "return_overlay_datasets": "false",
+                "sort": "id",
+            }
+        )
+        url = f'{config["base_url"]}/api/cmdb/v1.0/datasets?{query}'
+        req = urllib.request.Request(url, headers=cmdb_auth_headers(token), method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"CMDB dataset lookup failed: {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"CMDB dataset lookup failed: {exc.reason}") from exc
+        page = cmdb_parse_datasets(payload)
+        datasets.extend(page)
+        if len(page) < limit:
+            break
+        offset += limit
+
+    datasetids = []
+    for dataset in datasets:
+        dataset_type = dataset_value(dataset, "dataset_type", "datasetType", "type")
+        datasetid = str(dataset_value(dataset, "id", "name") or "").strip()
+        if datasetid and regular_dataset_type(dataset_type):
+            datasetids.append(datasetid)
+    return sorted(set(datasetids))
+
+
 def cmdb_lookup_instance(config, token, datasetid, instanceid):
     url = cmdb_lookup_url(config, datasetid, instanceid)
     req = urllib.request.Request(url, headers=cmdb_auth_headers(token), method="GET")
@@ -776,17 +843,23 @@ def apply_addm_duplicate_resolution(form):
 
 
 def dataset_options():
-    _, rows = execute_sql(
-        """
-SELECT DISTINCT
-    coredatasetid
-FROM bmc_core_config_bmc_dataset
-WHERE coredatasetid IS NOT NULL
-  AND datasettype = 0
-ORDER BY coredatasetid;
-"""
-    )
-    return [str(row[0]) for row in rows if row and row[0]]
+    portal_url = os.getenv("CMDB_REST_PORTAL_URL", "http://127.0.0.1:8010").rstrip("/")
+    req = urllib.request.Request(f"{portal_url}/datasets", headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=65) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        datasets = payload.get("datasets", []) if isinstance(payload, dict) else []
+        options = sorted({str(datasetid).strip() for datasetid in datasets if str(datasetid).strip()})
+        if options:
+            return options
+        raise RuntimeError("REST Portal returned no regular datasets.")
+    except Exception as portal_exc:
+        try:
+            return cmdb_regular_datasets()
+        except Exception as direct_exc:
+            raise RuntimeError(
+                f"REST Portal dataset list unavailable: {portal_exc}; direct CMDB lookup failed: {direct_exc}"
+            ) from direct_exc
 
 
 def connection_form_values():
@@ -2047,7 +2120,7 @@ def render_query_form(selected_key, params):
 
 def render_dataset_select(selected_datasetids):
     selected = set(selected_datasetids)
-    hint = '<p class="hint">Hold Command or Shift to select multiple datasets.</p>'
+    hint = '<p class="hint">Datasets loaded from the REST Portal. Hold Command or Shift to select multiple datasets.</p>'
     try:
         options = dataset_options()
     except Exception as exc:

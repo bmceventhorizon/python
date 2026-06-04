@@ -23,6 +23,7 @@ http://127.0.0.1:8010
 - Orphaned CIs
 - Relationship Data Quality Summary
 - Normalization Summary
+- Normalization and Company Summary
 
 All reports use CMDB REST endpoints under:
 
