@@ -3,6 +3,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -120,6 +121,11 @@ REPORTS = {
         "name": "Normalization and Company Summary",
         "description": "Groups all BaseElement CIs in the selected datasets and matches CI companies to COM:Company.",
         "definition": "GET BMC_BaseElement + GET /api/arsys/v1/entry/COM:Company, then match and group locally.",
+    },
+    "computer_system_attribute_sources": {
+        "name": "Computer System Attribute Sources",
+        "description": "Shows the source dataset for the Name attribute and translates AttributeDataSourceList field IDs.",
+        "definition": "GET /api/cmdb/v1.0/instances/{dataset}/BMC.CORE/BMC_ComputerSystem + GET /api/arsys/v1.0/fields/BMC.CORE:BMC_ComputerSystem",
     },
 }
 
@@ -401,6 +407,43 @@ def fetch_all_ar_entries(config, token, form_name, fields=None):
             break
         offset += limit
     return entries
+
+
+def fetch_ar_field_map(config, token, form_name):
+    url = f'{config["base_url"]}/api/arsys/v1.0/fields/{quote(form_name, safe="")}/'
+    req = urllib.request.Request(url, headers=auth_headers(token), method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"AR REST field metadata request failed for {form_name}: {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"AR REST field metadata request failed for {form_name}: {exc.reason}") from exc
+
+    if isinstance(payload, dict):
+        field_items = payload.get("fields") or payload.get("items") or payload.get("data") or []
+    elif isinstance(payload, list):
+        field_items = payload
+    else:
+        field_items = []
+
+    field_map = {}
+    for field in field_items:
+        if not isinstance(field, dict):
+            continue
+        field_id = field.get("id") or field.get("fieldId") or field.get("field_id") or field.get("fieldid")
+        field_name = (
+            field.get("name")
+            or field.get("fieldName")
+            or field.get("field_name")
+            or field.get("fieldname")
+        )
+        if field_id not in (None, "") and field_name:
+            field_map[str(field_id)] = str(field_name)
+    if not field_map:
+        raise RuntimeError(f"AR REST field metadata for {form_name} did not contain field IDs and names.")
+    return field_map
 
 
 def normalize_key(value):
@@ -1119,6 +1162,7 @@ def report_normalization_summary(params):
     for instance in instances:
         status = str(row_value(instance, "NormalizationStatus") or "")
         key = (
+            dataset_id(instance),
             normalization_status_label(status) or status or "(blank)",
             row_value(instance, "ClassId"),
             row_value(instance, "Category"),
@@ -1132,6 +1176,7 @@ def report_normalization_summary(params):
     rows.sort(key=lambda row: (-row[0],) + tuple(str(value) for value in row[1:]))
     return [
         "record_count",
+        "datasetid",
         "normalizationstatus",
         "classid",
         "category",
@@ -1143,7 +1188,7 @@ def report_normalization_summary(params):
 
 
 def report_normalization_candidates(params):
-    _, _, instances = fetch_selected_class_instances(params)
+    _, _, instances = fetch_base(params)
     candidate_labels = {
         "Not Normalized",
         "Normalization Failed",
@@ -1287,6 +1332,69 @@ def report_normalization_company_summary(params):
     ], rows[: params["limit"]]
 
 
+def attribute_data_source_segments(value):
+    return [segment for segment in str(value or "").split("/") if segment]
+
+
+def segment_field_names(segment, field_map):
+    field_ids = re.findall(r"(?<!\d)(\d+)(?!\d)", segment)
+    return sorted({field_map[field_id] for field_id in field_ids if field_id in field_map})
+
+
+def translate_attribute_data_source_list(value, field_map):
+    translated = []
+    for segment in attribute_data_source_segments(value):
+        names = segment_field_names(segment, field_map)
+        if not names:
+            translated.append(segment)
+            continue
+        prefix, separator, _ = segment.partition(":")
+        translated.append(f"{prefix}: {', '.join(names)}" if separator else ", ".join(names))
+    return " / ".join(translated)
+
+
+def report_computer_system_attribute_sources(params):
+    config = checked_rest_config()
+    token = cmdb_login(config)
+    field_map = fetch_ar_field_map(config, token, "BMC.CORE:BMC_ComputerSystem")
+    name_field_ids = {field_id for field_id, field_name in field_map.items() if field_name == "Name"}
+    instances, _ = fetch_all_instances(
+        config,
+        token,
+        params["datasetids"],
+        "BMC_ComputerSystem",
+        attributes=["Name", "DatasetId", "AttributeDataSourceList"],
+    )
+    rows = []
+    for instance in instances:
+        source_list = row_value(instance, "AttributeDataSourceList")
+        if source_list in (None, ""):
+            continue
+        name_source = ""
+        for segment in attribute_data_source_segments(source_list):
+            segment_ids = set(re.findall(r"(?<!\d)(\d+)(?!\d)", segment))
+            if name_field_ids.intersection(segment_ids) and ":" in segment:
+                name_source = segment.split(":", 1)[0]
+                break
+        rows.append(
+            (
+                name_source,
+                row_value(instance, "Name"),
+                dataset_id(instance),
+                source_list,
+                translate_attribute_data_source_list(source_list, field_map),
+            )
+        )
+    rows.sort(key=lambda row: str(row[1] or "").lower())
+    return [
+        "list",
+        "ci_name",
+        "dataset",
+        "attributedatasourcelist",
+        "attributedatasourcelist_fields",
+    ], rows[: params["limit"]]
+
+
 REPORT_RUNNERS = {
     "ci_by_class": report_ci_by_class,
     "ci_inventory": report_ci_inventory,
@@ -1296,6 +1404,7 @@ REPORT_RUNNERS = {
     "normalization_summary": report_normalization_summary,
     "normalization_candidates": report_normalization_candidates,
     "normalization_company_summary": report_normalization_company_summary,
+    "computer_system_attribute_sources": report_computer_system_attribute_sources,
 }
 
 
@@ -1439,6 +1548,14 @@ def render_layout(body):
     .actions {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
     .run-button {{ min-height:72px; display:flex; align-items:center; justify-content:center; gap:12px; font-size:18px; background:#05070c; border:1px solid #1e293b; }}
     .run-button img {{ width:92px; height:38px; object-fit:contain; border-radius:4px; }}
+    .run-button[aria-busy="true"] {{ cursor:wait; opacity:.88; }}
+    .spinner {{ display:none; width:22px; height:22px; border:3px solid rgba(255,255,255,.35); border-top-color:white; border-radius:50%; animation:spin .75s linear infinite; }}
+    .run-button[aria-busy="true"] .spinner {{ display:block; }}
+    .loading-bar {{ position:fixed; inset:0 0 auto 0; z-index:20; height:4px; overflow:hidden; background:rgba(20,108,148,.2); opacity:0; pointer-events:none; transition:opacity .15s ease; }}
+    .loading-bar::after {{ content:""; display:block; width:35%; height:100%; background:var(--accent); animation:loading-slide 1.1s ease-in-out infinite; }}
+    body.report-running .loading-bar {{ opacity:1; }}
+    @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+    @keyframes loading-slide {{ from {{ transform:translateX(-110%); }} to {{ transform:translateX(320%); }} }}
     .query-fields {{ display:grid; grid-template-columns:minmax(220px,1fr) minmax(240px,1.2fr); gap:14px; align-items:start; }}
     .compact-field {{ max-width:180px; }}
     .query-wide {{ grid-column:1 / -1; }}
@@ -1457,11 +1574,15 @@ def render_layout(body):
     .sort-button {{ display:flex; align-items:center; gap:6px; width:100%; min-height:0; margin:0; padding:0; border:0; border-radius:0; background:transparent; color:inherit; font:inherit; text-align:left; }}
     .sort-button:hover {{ background:transparent; color:var(--accent-dark); }}
     .sort-indicator {{ color:var(--muted); font-size:11px; min-width:10px; }}
+    .filter-row th {{ background:#e4eaf3; padding:4px 6px; position:sticky; top:37px; z-index:1; }}
+    .filter-row input, .filter-row select {{ width:100%; box-sizing:border-box; padding:3px 6px; font-size:12px; background:#fff; border:1px solid #c8d0dc; border-radius:3px; color:#1a202c; }}
+    .filter-row input:focus, .filter-row select:focus {{ outline:none; border-color:#5a7fc9; }}
     .empty {{ color:var(--muted); padding:24px; text-align:center; }}
     @media (max-width:860px) {{ .query-panel {{ grid-column:auto; }} .query-fields {{ grid-template-columns:1fr; }} .header-bar {{ align-items:flex-start; flex-direction:column; }} main {{ padding:14px; }} th,td {{ white-space:normal; }} }}
   </style>
 </head>
 <body>
+  <div class="loading-bar" aria-hidden="true"></div>
   <header>
     <div class="header-bar">
       <h1><img class="header-logo" src="/assets/2024-bmc-helix-reversed.png" alt="BMC Helix">{APP_TITLE}</h1>
@@ -1505,6 +1626,76 @@ def render_layout(body):
         }});
       }});
     }});
+
+    document.querySelectorAll("table[data-sortable='true']").forEach((table) => {{
+      table.querySelectorAll(".filter-row select[data-filter-col]").forEach(sel => {{
+        const col = Number(sel.dataset.filterCol);
+        const seen = new Set();
+        Array.from(table.tBodies[0].rows).forEach(row => {{
+          const cell = row.cells[col];
+          if (cell) {{ const v = cell.textContent.trim(); if (v) seen.add(v); }}
+        }});
+        Array.from(seen).sort((a, b) => a.localeCompare(b, undefined, {{ sensitivity: "base" }}))
+          .forEach(v => {{ const opt = document.createElement("option"); opt.value = v; opt.textContent = v; sel.appendChild(opt); }});
+      }});
+      const controls = table.querySelectorAll(".filter-row input[data-filter-col], .filter-row select[data-filter-col]");
+      if (!controls.length) return;
+      const applyFilters = () => {{
+        const filters = Array.from(controls)
+          .map(el => ({{ col: Number(el.dataset.filterCol), value: el.value.trim().toLowerCase(), exact: el.tagName === "SELECT" }}))
+          .filter(f => f.value);
+        Array.from(table.tBodies[0].rows).forEach(row => {{
+          row.style.display = filters.every(f => {{
+            const cell = row.cells[f.col];
+            if (!cell) return true;
+            const text = cell.textContent.trim().toLowerCase();
+            return f.exact ? text === f.value : text.includes(f.value);
+          }}) ? "" : "none";
+        }});
+      }};
+      controls.forEach(el => el.addEventListener(el.tagName === "SELECT" ? "change" : "input", applyFilters));
+    }});
+
+    document.querySelectorAll("form").forEach((form) => {{
+      form.addEventListener("submit", (e) => {{
+        const submitter = e.submitter;
+        if (!submitter) return;
+        if (submitter.id === "run-report-button") return;
+        submitter.disabled = true;
+        const span = submitter.querySelector("span") || submitter;
+        const original = span.textContent;
+        span.textContent = "Running…";
+        submitter.classList.add("running");
+        const cleanup = () => {{
+          submitter.disabled = false;
+          span.textContent = original;
+          submitter.classList.remove("running");
+        }};
+        window.addEventListener("pageshow", cleanup, {{ once: true }});
+        setTimeout(cleanup, 60000);
+      }});
+    }});
+
+    const reportForm = document.getElementById("report-form");
+    const runReportButton = document.getElementById("run-report-button");
+    if (reportForm && runReportButton) {{
+      reportForm.addEventListener("submit", (event) => {{
+        if (event.submitter !== runReportButton) return;
+        document.body.classList.add("report-running");
+        runReportButton.setAttribute("aria-busy", "true");
+        runReportButton.disabled = true;
+        const label = runReportButton.querySelector(".run-label");
+        if (label) label.textContent = "Running REST Report...";
+        const cleanup = () => {{
+          document.body.classList.remove("report-running");
+          runReportButton.removeAttribute("aria-busy");
+          runReportButton.disabled = false;
+          if (label) label.textContent = "Run REST Report";
+        }};
+        window.addEventListener("pageshow", cleanup, {{ once: true }});
+        setTimeout(cleanup, 60000);
+      }});
+    }}
   </script>
 </body>
 </html>"""
@@ -1578,7 +1769,7 @@ def render_query_form(report_key, params):
 <section class="panel query-panel">
   <h2>REST Reports</h2>
   <div class="panel-body">
-    <form method="post" action="/run">
+    <form id="report-form" method="post" action="/run">
       <div class="query-fields">
         <div>
           <label for="report">Report</label>
@@ -1603,9 +1794,10 @@ def render_query_form(report_key, params):
           <pre class="sql">{esc(definition)}</pre>
         </div>
       </div>
-      <button class="run-button" type="submit">
+      <button class="run-button" id="run-report-button" type="submit">
         <img src="/assets/blackholesurfer-logo.jpg" alt="">
-        <span>Run REST Report</span>
+        <span class="spinner" aria-hidden="true"></span>
+        <span class="run-label">Run REST Report</span>
       </button>
       <div class="actions">
         <button class="secondary" type="submit" formaction="/duplicates/preview">Preview New Duplicate Resolution</button>
@@ -1673,7 +1865,16 @@ def render_table(columns, rows, report_key=None, params=None):
         )
         body_rows.append("<tr>" + action + "".join(f"<td>{esc(value)}</td>" for value in row) + "</tr>")
     body = "".join(body_rows)
-    return f"""<div class="table-wrap"><table data-sortable="true"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"""
+    dropdown_cols = {"normalizationstatus", "classid", "manufacturername"}
+    filter_cells = "".join(
+        "<th></th>" if column == "action"
+        else f'<th><select data-filter-col="{index}"><option value="">All</option></select></th>'
+        if column.lower() in dropdown_cols
+        else f'<th><input type="text" placeholder="Filter…" data-filter-col="{index}" autocomplete="off"></th>'
+        for index, column in enumerate(display_columns)
+    )
+    filter_row = f'<tr class="filter-row">{filter_cells}</tr>'
+    return f"""<div class="table-wrap"><table data-sortable="true"><thead><tr>{head}</tr>{filter_row}</thead><tbody>{body}</tbody></table></div>"""
 
 
 def render_page(
